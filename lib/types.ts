@@ -73,3 +73,50 @@ export interface DashboardPayload {
   keys: DashboardKeyRow[];
   models: DashboardModelRow[];
 }
+
+export type AppView = 'dashboard' | 'limits';
+export type AlertSeverity = 'info' | 'warning' | 'urgent';
+
+export interface LimitsQuotaWindow {
+  label: string;
+  usedPercent: number;
+  remainingPercent: number;
+  resetAt: string | null;
+  resetAfterSeconds: number | null;
+}
+
+export interface LimitsAlert {
+  id: string;
+  severity: AlertSeverity;
+  title: string;
+  message: string;
+  accountLabel: string;
+}
+
+export interface LimitsAccountRow {
+  id: string;
+  email: string;
+  displayName: string;
+  planType: string | null;
+  status: 'active' | 'expired' | 'error';
+  sourceLabel: string;
+  successCount: number;
+  failureCount: number;
+  updatedAt: string | null;
+  fiveHour: LimitsQuotaWindow | null;
+  weekly: LimitsQuotaWindow | null;
+  alert: LimitsAlert | null;
+  error: string | null;
+}
+
+export interface LimitsPayload {
+  generatedAt: string;
+  summary: {
+    totalAccounts: number;
+    activeAccounts: number;
+    resetSoonCount: number;
+    exhaustedWeeklyCount: number;
+  };
+  alerts: LimitsAlert[];
+  accounts: LimitsAccountRow[];
+}
