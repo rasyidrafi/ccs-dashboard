@@ -124,6 +124,11 @@ interface NormalizedKeyInfo {
   providerLabel: string;
 }
 
+interface LoadedRequests {
+  requests: NormalizedRequest[];
+  hasSnapshotData: boolean;
+}
+
 const PRICING: Record<
   string,
   { inputPerMillion: number; outputPerMillion: number; cacheReadPerMillion: number }
@@ -159,14 +164,14 @@ const PRICING_ALIASES: Record<string, string> = {
 
 export function parseDashboardQuery(params: URLSearchParams): DashboardQuery {
   const preset = params.get('preset');
-  if (preset === '7d' || preset === '30d' || preset === 'custom' || preset === '24h') {
+  if (preset === 'all' || preset === 'today' || preset === 'week' || preset === 'month' || preset === 'year' || preset === 'custom') {
     return {
       preset,
       from: params.get('from') ?? undefined,
       to: params.get('to') ?? undefined,
     };
   }
-  return { preset: '24h' };
+  return { preset: 'today' };
 }
 
 function parseYamlText<T>(value: string | null): T | null {
@@ -385,7 +390,7 @@ async function fetchLiveRequests(
   return { requests, discoveredConfiguredKeys };
 }
 
-async function loadFallbackRequests(ccsDir: string): Promise<NormalizedRequest[]> {
+async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
   const snapshotPath = path.join(ccsDir, 'cache', 'cliproxy-usage', 'latest.json');
   const text = await readUtf8(snapshotPath);
   const snapshot = parseYamlText<SnapshotPayload>(text);
@@ -406,7 +411,51 @@ async function loadFallbackRequests(ccsDir: string): Promise<NormalizedRequest[]
     });
   }
 
-  return requests;
+  return {
+    requests,
+    hasSnapshotData: Array.isArray(snapshot?.details) && snapshot.details.length > 0,
+  };
+}
+
+function requestIdentity(request: NormalizedRequest): string {
+  return [
+    request.keyId,
+    request.model,
+    request.timestamp,
+    request.inputTokens,
+    request.outputTokens,
+    request.cacheReadTokens,
+    request.requestCount,
+  ].join('|');
+}
+
+function mergeRequests(
+  fallbackRequests: NormalizedRequest[],
+  liveRequests: NormalizedRequest[]
+): {
+  requests: NormalizedRequest[];
+  usedFallbackHistory: boolean;
+} {
+  const merged = new Map<string, NormalizedRequest>();
+
+  for (const request of fallbackRequests) {
+    merged.set(requestIdentity(request), request);
+  }
+
+  let liveOverlaps = 0;
+  for (const request of liveRequests) {
+    const key = requestIdentity(request);
+    if (merged.has(key)) {
+      liveOverlaps += 1;
+    }
+    // Prefer live rows when the same event exists in both sources.
+    merged.set(key, request);
+  }
+
+  return {
+    requests: Array.from(merged.values()),
+    usedFallbackHistory: fallbackRequests.length > 0 && merged.size > Math.max(liveRequests.length, liveOverlaps),
+  };
 }
 
 function computeRange(query: DashboardQuery): {
@@ -416,31 +465,58 @@ function computeRange(query: DashboardQuery): {
   label: string;
 } {
   const now = new Date();
+  const startOfToday = new Date(now);
+  startOfToday.setHours(0, 0, 0, 0);
 
-  if (query.preset === '24h') {
+  if (query.preset === 'all') {
     return {
-      from: new Date(now.getTime() - 24 * 60 * 60 * 1000),
+      from: new Date('2000-01-01T00:00:00.000Z'),
+      to: now,
+      granularity: 'daily',
+      label: 'All time',
+    };
+  }
+
+  if (query.preset === 'today') {
+    return {
+      from: startOfToday,
       to: now,
       granularity: 'hourly',
-      label: 'Last 24 hours',
+      label: 'Today',
     };
   }
 
-  if (query.preset === '7d') {
+  if (query.preset === 'week') {
+    const startOfWeek = new Date(startOfToday);
+    const dayOffset = (startOfWeek.getDay() + 6) % 7;
+    startOfWeek.setDate(startOfWeek.getDate() - dayOffset);
     return {
-      from: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000),
+      from: startOfWeek,
       to: now,
       granularity: 'daily',
-      label: 'Last 7 days',
+      label: 'This week',
     };
   }
 
-  if (query.preset === '30d') {
+  if (query.preset === 'month') {
+    const startOfMonth = new Date(startOfToday);
+    startOfMonth.setDate(1);
     return {
-      from: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000),
+      from: startOfMonth,
       to: now,
       granularity: 'daily',
-      label: 'Last 30 days',
+      label: 'This month',
+    };
+  }
+
+  if (query.preset === 'year') {
+    const startOfYear = new Date(startOfToday);
+    startOfYear.setMonth(0, 1);
+    return {
+      from: startOfYear,
+      to: now,
+      granularity: 'daily',
+      label: 'This year',
     };
   }
 
@@ -465,7 +541,7 @@ function bucketLabel(date: Date, granularity: TrendGranularity): { key: string; 
     bucket.setMinutes(0, 0, 0);
     return {
       key: bucket.toISOString(),
-      label: new Intl.DateTimeFormat('en-US', { hour: 'numeric' }).format(bucket),
+      label: new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false }).format(bucket),
     };
   }
 
@@ -618,22 +694,29 @@ export async function getDashboardPayload(query: DashboardQuery): Promise<Dashbo
   let requests: NormalizedRequest[] = [];
   let mode: 'live' | 'fallback' | 'mixed' = 'live';
   let note: string | null = null;
+  const fallback = await loadFallbackRequests(ctx.ccsDir);
 
   try {
     const live = await fetchLiveRequests(ctx);
-    requests = live.requests;
+    const merged = mergeRequests(fallback.requests, live.requests);
+    requests = merged.requests;
+    if (fallback.requests.length > 0) {
+      mode = 'mixed';
+      note = merged.usedFallbackHistory
+        ? 'Dashboard history is merged from persisted ~/.ccs cache plus live management data. Live data takes precedence when duplicate events overlap.'
+        : 'Live management data matched the persisted history snapshot. Duplicate events were deduplicated automatically.';
+    }
   } catch {
-    requests = await loadFallbackRequests(ctx.ccsDir);
+    requests = fallback.requests;
     mode = 'fallback';
     note =
       'Live management data was unavailable. This view is using ~/.ccs/cache/cliproxy-usage/latest.json as fallback.';
   }
 
-  const fallbackRequests = mode === 'fallback' ? requests : [];
-  if (mode === 'live' && requests.length === 0) {
-    const fallback = await loadFallbackRequests(ctx.ccsDir);
-    if (fallback.length > 0) {
-      requests = fallback;
+  const fallbackRequests = mode === 'fallback' ? requests : fallback.requests;
+  if (requests.length === 0 && fallback.requests.length > 0) {
+    requests = fallback.requests;
+    if (mode === 'live') {
       mode = 'mixed';
       note = 'Live API responded without usable request details, so fallback snapshot data was used for continuity.';
     }
@@ -649,7 +732,7 @@ export async function getDashboardPayload(query: DashboardQuery): Promise<Dashbo
   const totalCost = keys.reduce((sum, row) => sum + row.cost, 0);
   const hasConfiguredRows = keys.some((row) => row.sourceState === 'config');
 
-  if (mode === 'fallback' && fallbackRequests.length === 0) {
+  if ((mode === 'fallback' || mode === 'mixed') && fallbackRequests.length === 0 && !fallback.hasSnapshotData) {
     note =
       'Neither live management usage nor fallback snapshot data returned usable API-key requests.';
   }

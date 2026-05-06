@@ -1,4 +1,4 @@
-export type DatePreset = '24h' | '7d' | '30d' | 'custom';
+export type DatePreset = 'all' | 'today' | 'week' | 'month' | 'year' | 'custom';
 export type TrendGranularity = 'hourly' | 'daily';
 export type RowSourceState = 'live' | 'fallback' | 'config';
 

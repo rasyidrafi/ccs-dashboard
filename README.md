@@ -1,50 +1,36 @@
-# `ccs-dashboard`
+This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
-Standalone Next.js dashboard for manager-facing CLIProxy API-key usage analytics.
+## Getting Started
 
-It is designed to run locally next to CCS and prefers the live CLIProxy management API, with fallback to the CCS snapshot cache when live data is unavailable.
-
-## Features
-
-- Summary cards for requests, tokens, cost, and active API keys
-- Presets for `24H`, `7D`, `30D`, plus custom date range
-- Trend chart with hourly or daily bucketing
-- Per-key usage table with alias, fingerprint, masked key, token mix, models, and last used
-- Model breakdown table
-- Source badges for live API, config discovery, and fallback mode
-
-## Configuration
-
-Copy `.env.example` if you want explicit overrides:
+First, run the development server:
 
 ```bash
-CCS_DIR=
-CLIPROXY_MANAGEMENT_URL=
-CLIPROXY_MANAGEMENT_SECRET=
-```
-
-Resolution order:
-
-1. `CLIPROXY_MANAGEMENT_URL`
-2. auto-discovered local URL from `~/.ccs/config.yaml` / `~/.ccs/cliproxy/config.yaml`
-
-Management secret resolution:
-
-1. `CLIPROXY_MANAGEMENT_SECRET`
-2. `cliproxy.auth.management_secret` from `~/.ccs/config.yaml`
-3. CCS default management secret compatibility fallback
-
-## Run
-
-```bash
-npm install
 npm run dev
+# or
+yarn dev
+# or
+pnpm dev
+# or
+bun dev
 ```
 
-Then open `http://localhost:3000`.
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-## Notes
+You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
-- The app reads from `~/.ccs` for discovery and fallback only.
-- It does not modify `~/.ccs`.
-- Live data comes from CLIProxy management endpoints when available.
+This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+
+## Learn More
+
+To learn more about Next.js, take a look at the following resources:
+
+- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
+- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+
+You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+
+## Deploy on Vercel
+
+The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+
+Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
