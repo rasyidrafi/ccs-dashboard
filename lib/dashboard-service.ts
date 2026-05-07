@@ -570,8 +570,9 @@ function resolveWindow(query: DashboardQuery, requests: NormalizedRequest[] = []
   if (query.preset === 'year') {
     const startOfYear = new Date(startOfToday);
     startOfYear.setMonth(0, 1);
+    const firstRequestDate = getFirstRequestDateInRange(requests, startOfYear, now);
     return {
-      from: startOfYear,
+      from: firstRequestDate ? startOfPreviousMonthOrYearStart(firstRequestDate, startOfYear) : startOfYear,
       to: now,
       label: 'This year',
     };
@@ -601,10 +602,14 @@ function resolveWindow(query: DashboardQuery, requests: NormalizedRequest[] = []
 
 function resolveGranularity(query: DashboardQuery, window: DashboardWindow): ResolvedRange {
   const requestedGranularity = query.granularity ?? null;
+  if (query.preset === 'year') {
+    return { ...window, requestedGranularity, resolvedGranularity: 'monthly' };
+  }
+
   if (requestedGranularity && requestedGranularity !== 'auto') {
     return {
       ...window,
-      from: query.preset === 'all' ? startOfBucket(window.from, requestedGranularity, window) : window.from,
+      from: query.preset === 'all' ? startOfAllTimeBucket(window.from, requestedGranularity) : window.from,
       requestedGranularity,
       resolvedGranularity: requestedGranularity,
     };
@@ -618,10 +623,6 @@ function resolveGranularity(query: DashboardQuery, window: DashboardWindow): Res
     return { ...window, requestedGranularity, resolvedGranularity: 'daily' };
   }
 
-  if (query.preset === 'year') {
-    return { ...window, requestedGranularity, resolvedGranularity: 'monthly' };
-  }
-
   const fromDay = startOfLocalDay(window.from);
   const toDay = startOfLocalDay(window.to);
   const selectedDays = Math.floor((toDay.getTime() - fromDay.getTime()) / DAY_MS) + 1;
@@ -630,7 +631,7 @@ function resolveGranularity(query: DashboardQuery, window: DashboardWindow): Res
     const resolvedGranularity = selectedDays > 3 * 365 ? 'yearly' : 'monthly';
     return {
       ...window,
-      from: startOfBucket(window.from, resolvedGranularity, window),
+      from: startOfAllTimeBucket(window.from, resolvedGranularity),
       requestedGranularity,
       resolvedGranularity,
     };
@@ -660,6 +661,44 @@ function getFirstRequestDate(requests: NormalizedRequest[]): Date | null {
   }
 
   return Number.isFinite(firstTimestampMs) ? new Date(firstTimestampMs) : null;
+}
+
+function getFirstRequestDateInRange(requests: NormalizedRequest[], from: Date, to: Date): Date | null {
+  let firstTimestampMs = Number.POSITIVE_INFINITY;
+  const fromMs = from.getTime();
+  const toMs = to.getTime();
+
+  for (const request of requests) {
+    if (request.timestampMs < fromMs || request.timestampMs > toMs) continue;
+    if (request.timestampMs < firstTimestampMs) {
+      firstTimestampMs = request.timestampMs;
+    }
+  }
+
+  return Number.isFinite(firstTimestampMs) ? new Date(firstTimestampMs) : null;
+}
+
+function startOfPreviousMonthOrYearStart(date: Date, startOfYear: Date): Date {
+  const bucket = startOfLocalMonth(date);
+  if (bucket.getMonth() === 0) return startOfYear;
+  bucket.setMonth(bucket.getMonth() - 1);
+  return bucket.getTime() < startOfYear.getTime() ? startOfYear : bucket;
+}
+
+function startOfAllTimeBucket(date: Date, granularity: TrendGranularity): Date {
+  if (granularity === 'yearly') {
+    const bucket = startOfLocalYear(date);
+    bucket.setFullYear(bucket.getFullYear() - 1);
+    return bucket;
+  }
+
+  if (granularity === 'monthly') {
+    const bucket = startOfLocalMonth(date);
+    bucket.setMonth(bucket.getMonth() - 1);
+    return bucket;
+  }
+
+  return startOfBucket(date, granularity, { from: date, to: date, label: 'All time' });
 }
 
 function inRange(timestampMs: number, from: Date, to: Date): boolean {

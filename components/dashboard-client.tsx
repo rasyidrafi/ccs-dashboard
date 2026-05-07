@@ -380,9 +380,16 @@ function getGranularityOptions(preset: DatePreset): Array<{ value: TrendGranular
     ]
   }
 
-  if (preset === "year" || preset === "all") {
+  if (preset === "year") {
     return [
-      { value: "auto", label: preset === "all" ? "Auto" : "Auto (monthly)" },
+      { value: "auto", label: "Auto (monthly)" },
+      { value: "monthly", label: "Monthly" },
+    ]
+  }
+
+  if (preset === "all") {
+    return [
+      { value: "auto", label: "Auto" },
       { value: "monthly", label: "Monthly" },
       { value: "yearly", label: "Yearly" },
     ]
