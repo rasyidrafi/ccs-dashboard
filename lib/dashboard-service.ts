@@ -1,8 +1,13 @@
-import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import YAML from 'yaml';
+import {
+  buildStablePublicId,
+  redactSensitiveText,
+  redactToken,
+  shortUsageHash,
+} from '@/lib/redaction';
 import type {
   DashboardKeyRow,
   DashboardModelRow,
@@ -252,22 +257,16 @@ function pickString(value: unknown, keys: string[]): string | undefined {
   return undefined;
 }
 
-function shortUsageHash(value: string): string {
-  return createHash('sha256').update(value).digest('hex').slice(0, 12);
-}
-
 function keyBucketId(key: string): string {
   return `api-key:${shortUsageHash(key).slice(0, 8)}`;
 }
 
 function maskKey(key: string): string {
-  if (key.length <= 8) return '••••';
-  return `${key.slice(0, 4)}••••${key.slice(-4)}`;
+  return redactToken(key);
 }
 
 function inferKeyLabel(key: string): string {
-  const prefix = key.split('-sk-')[0]?.trim();
-  return prefix || keyBucketId(key);
+  return `API key ${buildStablePublicId(key)}`;
 }
 
 function buildKeyInfo(ctx: ResolvedContext): Map<string, NormalizedKeyInfo> {
@@ -275,12 +274,15 @@ function buildKeyInfo(ctx: ResolvedContext): Map<string, NormalizedKeyInfo> {
   for (const key of ctx.configuredKeys) {
     const metadata = ctx.keyMetadata.get(key);
     const keyId = keyBucketId(key);
+    const safeDisplayName = redactSensitiveText(metadata?.displayName);
+    const safeLabel = redactSensitiveText(metadata?.label);
+    const fallbackLabel = inferKeyLabel(key);
     result.set(keyId, {
       keyId,
       fingerprint: keyId.replace('api-key:', ''),
       maskedKey: maskKey(key),
-      displayName: metadata?.displayName || metadata?.label || inferKeyLabel(key),
-      providerLabel: metadata?.label || inferKeyLabel(key),
+      displayName: safeDisplayName || safeLabel || fallbackLabel,
+      providerLabel: safeLabel || fallbackLabel,
     });
   }
   return result;
@@ -618,8 +620,8 @@ function buildKeyRows(
     const info = keyInfo.get(request.keyId) ?? {
       keyId: request.keyId,
       fingerprint: request.keyId.replace('api-key:', ''),
-      maskedKey: request.keyId,
-      displayName: request.keyId,
+      maskedKey: redactToken(request.keyId),
+      displayName: `API key ${request.keyId.replace('api-key:', '').toUpperCase()}`,
       providerLabel: 'Discovered bucket',
     };
     const existing = rows.get(request.keyId) ?? {

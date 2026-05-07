@@ -305,7 +305,9 @@ function DashboardOverview({
           </div>
         </CardContent>
         <CardFooter className="border-t text-xs text-muted-foreground">
-          Custom dates apply only when <span className="font-medium text-foreground">Custom</span> is selected.
+          <p>
+            Custom dates apply only when <span className="font-medium text-foreground">Custom</span> is selected.
+          </p>
         </CardFooter>
       </Card>
     </section>

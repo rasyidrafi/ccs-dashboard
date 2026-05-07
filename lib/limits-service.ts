@@ -2,6 +2,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import YAML from 'yaml';
+import { buildStablePublicId, redactEmail, redactSensitiveText } from '@/lib/redaction';
 import type { LimitsAccountRow, LimitsAlert, LimitsPayload, LimitsQuotaWindow } from '@/lib/types';
 
 const DEFAULT_MANAGEMENT_SECRET = 'ccs';
@@ -170,6 +171,24 @@ function isExpired(expiresAt: string | null | undefined): boolean {
   return Number.isFinite(value) && value <= Date.now();
 }
 
+function resolveMaskedAccountIdentity(
+  entry: AuthFileApiEntry,
+  auth: AuthFileRecord | null,
+  sourceLabel: string
+) {
+  const rawEmail = entry.email || auth?.email || '';
+  const redactedEmail = redactEmail(rawEmail);
+  const displayNameSource =
+    redactSensitiveText(entry.label) ||
+    (entry.name?.trim() ? redactSensitiveText(entry.name) : '') ||
+    `Codex account ${buildStablePublicId(sourceLabel || rawEmail || 'codex-account')}`;
+
+  return {
+    displayName: displayNameSource,
+    email: redactedEmail,
+  };
+}
+
 function resolveWindow(label: string, raw: CodexUsageWindow | undefined | null): LimitsQuotaWindow | null {
   if (!raw) return null;
   const usedPercentRaw = raw.used_percent ?? raw.usedPercent ?? 0;
@@ -280,14 +299,14 @@ export async function getLimitsPayload(forceRefresh = false): Promise<LimitsPayl
       const filePath = entry.path || path.join(ctx.authDir, entry.name || '');
       const raw = await readUtf8(filePath);
       const auth = raw ? (JSON.parse(raw) as AuthFileRecord) : null;
-      const displayName = entry.label || entry.email || auth?.email || entry.name || 'Codex account';
       const sourceLabel = entry.name || path.basename(filePath);
+      const identity = resolveMaskedAccountIdentity(entry, auth, sourceLabel);
 
       if (!auth) {
         return {
           id: sourceLabel,
-          email: entry.email || '',
-          displayName,
+          email: identity.email,
+          displayName: identity.displayName,
           planType: null,
           status: 'error',
           sourceLabel,
@@ -304,8 +323,8 @@ export async function getLimitsPayload(forceRefresh = false): Promise<LimitsPayl
       if (isExpired(auth.expired)) {
         return {
           id: sourceLabel,
-          email: entry.email || auth.email || '',
-          displayName,
+          email: identity.email,
+          displayName: identity.displayName,
           planType: null,
           status: 'expired',
           sourceLabel,
@@ -323,8 +342,8 @@ export async function getLimitsPayload(forceRefresh = false): Promise<LimitsPayl
         const quota = await fetchCodexQuota(auth);
         const rowBase = {
           id: sourceLabel,
-          email: entry.email || auth.email || '',
-          displayName,
+          email: identity.email,
+          displayName: identity.displayName,
           planType: quota.planType,
           status: 'active' as const,
           sourceLabel,
@@ -347,8 +366,8 @@ export async function getLimitsPayload(forceRefresh = false): Promise<LimitsPayl
       } catch (error) {
         return {
           id: sourceLabel,
-          email: entry.email || auth.email || '',
-          displayName,
+          email: identity.email,
+          displayName: identity.displayName,
           planType: null,
           status: 'error',
           sourceLabel,
