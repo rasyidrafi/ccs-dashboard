@@ -266,7 +266,8 @@ function maskKey(key: string): string {
 }
 
 function inferKeyLabel(key: string): string {
-  return `API key ${buildStablePublicId(key)}`;
+  const prefix = key.split('-sk-')[0]?.trim();
+  return prefix || `API key ${buildStablePublicId(key)}`;
 }
 
 function buildKeyInfo(ctx: ResolvedContext): Map<string, NormalizedKeyInfo> {
@@ -621,7 +622,7 @@ function buildKeyRows(
       keyId: request.keyId,
       fingerprint: request.keyId.replace('api-key:', ''),
       maskedKey: redactToken(request.keyId),
-      displayName: `API key ${request.keyId.replace('api-key:', '').toUpperCase()}`,
+      displayName: request.keyId,
       providerLabel: 'Discovered bucket',
     };
     const existing = rows.get(request.keyId) ?? {

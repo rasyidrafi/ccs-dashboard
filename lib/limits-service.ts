@@ -180,6 +180,7 @@ function resolveMaskedAccountIdentity(
   const redactedEmail = redactEmail(rawEmail);
   const displayNameSource =
     redactSensitiveText(entry.label) ||
+    redactedEmail ||
     (entry.name?.trim() ? redactSensitiveText(entry.name) : '') ||
     `Codex account ${buildStablePublicId(sourceLabel || rawEmail || 'codex-account')}`;
 
