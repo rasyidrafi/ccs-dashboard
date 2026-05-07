@@ -17,11 +17,14 @@ import type {
   DashboardTrendPoint,
   DatePreset,
   RowSourceState,
+  TrendGranularityInput,
   TrendGranularity,
 } from '@/lib/types';
 
 const DEFAULT_MANAGEMENT_SECRET = 'ccs';
 const DEFAULT_PORT = 8097;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SOURCE_CACHE_TTL_MS = 30_000;
 
 interface UnifiedConfig {
   cliproxy?: {
@@ -113,6 +116,7 @@ interface NormalizedRequest {
   keyId: string;
   model: string;
   timestamp: string;
+  timestampMs: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -133,6 +137,39 @@ interface LoadedRequests {
   requests: NormalizedRequest[];
   hasSnapshotData: boolean;
 }
+
+interface DashboardWindow {
+  from: Date;
+  to: Date;
+  label: string;
+}
+
+interface ResolvedRange extends DashboardWindow {
+  requestedGranularity: TrendGranularityInput | null;
+  resolvedGranularity: TrendGranularity;
+}
+
+interface LoadedDashboardData {
+  ctx: ResolvedContext;
+  requests: NormalizedRequest[];
+  mode: 'live' | 'fallback' | 'mixed';
+  note: string | null;
+  fallback: LoadedRequests;
+  fallbackRequestCountForMode: number;
+}
+
+interface AggregatedDashboardData {
+  trend: DashboardTrendPoint[];
+  keys: DashboardKeyRow[];
+  models: DashboardModelRow[];
+  totalRequests: number;
+  totalTokens: number;
+  totalCost: number;
+  activeKeys: number;
+  hasConfiguredRows: boolean;
+}
+
+let sourceCache: { loadedAt: number; data: LoadedDashboardData } | null = null;
 
 const PRICING: Record<
   string,
@@ -169,14 +206,30 @@ const PRICING_ALIASES: Record<string, string> = {
 
 export function parseDashboardQuery(params: URLSearchParams): DashboardQuery {
   const preset = params.get('preset');
+  const granularity = parseGranularityInput(params.get('granularity'));
   if (preset === 'all' || preset === 'today' || preset === 'week' || preset === 'month' || preset === 'year' || preset === 'custom') {
     return {
       preset,
       from: params.get('from') ?? undefined,
       to: params.get('to') ?? undefined,
+      granularity,
     };
   }
-  return { preset: 'today' };
+  return { preset: 'today', granularity };
+}
+
+function parseGranularityInput(value: string | null): TrendGranularityInput | undefined {
+  if (
+    value === 'auto' ||
+    value === 'hourly' ||
+    value === 'daily' ||
+    value === 'weekly' ||
+    value === 'monthly' ||
+    value === 'yearly'
+  ) {
+    return value;
+  }
+  return undefined;
 }
 
 function parseYamlText<T>(value: string | null): T | null {
@@ -303,6 +356,14 @@ function calculateCost(model: string, inputTokens: number, outputTokens: number,
   );
 }
 
+function normalizeRequest(
+  request: Omit<NormalizedRequest, 'timestampMs'>
+): NormalizedRequest | null {
+  const timestampMs = new Date(request.timestamp).getTime();
+  if (!Number.isFinite(timestampMs)) return null;
+  return { ...request, timestampMs };
+}
+
 async function fetchJson<T>(url: string, secret: string): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4_000);
@@ -356,7 +417,7 @@ async function fetchLiveRequests(
         const inputTokens = detail.tokens?.input_tokens ?? 0;
         const outputTokens = detail.tokens?.output_tokens ?? 0;
         const cacheReadTokens = detail.tokens?.cached_tokens ?? 0;
-        requests.push({
+        const request = normalizeRequest({
           keyId: providerKey,
           model,
           timestamp: detail.timestamp,
@@ -367,6 +428,7 @@ async function fetchLiveRequests(
           cost: calculateCost(model, inputTokens, outputTokens, cacheReadTokens),
           sourceState: 'live',
         });
+        if (request) requests.push(request);
       }
     }
   }
@@ -401,7 +463,7 @@ async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
 
   for (const detail of snapshot?.details ?? []) {
     if (!detail.provider.startsWith('api-key:')) continue;
-    requests.push({
+    const request = normalizeRequest({
       keyId: detail.provider,
       model: detail.model,
       timestamp: detail.timestamp,
@@ -412,6 +474,7 @@ async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
       cost: detail.cost,
       sourceState: 'fallback',
     });
+    if (request) requests.push(request);
   }
 
   return {
@@ -461,21 +524,16 @@ function mergeRequests(
   };
 }
 
-function computeRange(query: DashboardQuery): {
-  from: Date;
-  to: Date;
-  granularity: TrendGranularity;
-  label: string;
-} {
+function resolveWindow(query: DashboardQuery, requests: NormalizedRequest[] = []): DashboardWindow {
   const now = new Date();
   const startOfToday = new Date(now);
   startOfToday.setHours(0, 0, 0, 0);
 
   if (query.preset === 'all') {
+    const firstRequestDate = getFirstRequestDate(requests) ?? now;
     return {
-      from: new Date('2000-01-01T00:00:00.000Z'),
+      from: firstRequestDate,
       to: now,
-      granularity: 'daily',
       label: 'All time',
     };
   }
@@ -484,7 +542,6 @@ function computeRange(query: DashboardQuery): {
     return {
       from: startOfToday,
       to: now,
-      granularity: 'hourly',
       label: 'Today',
     };
   }
@@ -496,7 +553,6 @@ function computeRange(query: DashboardQuery): {
     return {
       from: startOfWeek,
       to: now,
-      granularity: 'daily',
       label: 'This week',
     };
   }
@@ -507,7 +563,6 @@ function computeRange(query: DashboardQuery): {
     return {
       from: startOfMonth,
       to: now,
-      granularity: 'daily',
       label: 'This month',
     };
   }
@@ -518,83 +573,207 @@ function computeRange(query: DashboardQuery): {
     return {
       from: startOfYear,
       to: now,
-      granularity: 'daily',
       label: 'This year',
     };
   }
 
-  const from = query.from ? new Date(`${query.from}T00:00:00`) : new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const to = query.to ? new Date(`${query.to}T23:59:59.999`) : now;
+  const fallbackFrom = new Date(now.getTime() - 7 * DAY_MS);
+  fallbackFrom.setHours(0, 0, 0, 0);
+  const parsedFrom = query.from ? new Date(`${query.from}T00:00:00`) : fallbackFrom;
+  const parsedTo = query.to ? new Date(`${query.to}T23:59:59.999`) : now;
+  const from = Number.isFinite(parsedFrom.getTime()) ? parsedFrom : fallbackFrom;
+  const to = Number.isFinite(parsedTo.getTime()) ? parsedTo : now;
+
+  if (from.getTime() > to.getTime()) {
+    return {
+      from: to,
+      to: from,
+      label: 'Custom range',
+    };
+  }
+
   return {
     from,
     to,
-    granularity: 'daily',
     label: 'Custom range',
   };
 }
 
-function inRange(timestamp: string, from: Date, to: Date): boolean {
-  const value = new Date(timestamp).getTime();
-  return value >= from.getTime() && value <= to.getTime();
+function resolveGranularity(query: DashboardQuery, window: DashboardWindow): ResolvedRange {
+  const requestedGranularity = query.granularity ?? null;
+  if (requestedGranularity && requestedGranularity !== 'auto') {
+    return {
+      ...window,
+      from: query.preset === 'all' ? startOfBucket(window.from, requestedGranularity, window) : window.from,
+      requestedGranularity,
+      resolvedGranularity: requestedGranularity,
+    };
+  }
+
+  if (query.preset === 'today') {
+    return { ...window, requestedGranularity, resolvedGranularity: 'hourly' };
+  }
+
+  if (query.preset === 'week' || query.preset === 'month') {
+    return { ...window, requestedGranularity, resolvedGranularity: 'daily' };
+  }
+
+  if (query.preset === 'year') {
+    return { ...window, requestedGranularity, resolvedGranularity: 'monthly' };
+  }
+
+  const fromDay = startOfLocalDay(window.from);
+  const toDay = startOfLocalDay(window.to);
+  const selectedDays = Math.floor((toDay.getTime() - fromDay.getTime()) / DAY_MS) + 1;
+
+  if (query.preset === 'all') {
+    const resolvedGranularity = selectedDays > 3 * 365 ? 'yearly' : 'monthly';
+    return {
+      ...window,
+      from: startOfBucket(window.from, resolvedGranularity, window),
+      requestedGranularity,
+      resolvedGranularity,
+    };
+  }
+
+  if (selectedDays <= 31) {
+    return { ...window, requestedGranularity, resolvedGranularity: 'daily' };
+  }
+
+  if (selectedDays <= 365) {
+    return { ...window, requestedGranularity, resolvedGranularity: 'monthly' };
+  }
+
+  return { ...window, requestedGranularity, resolvedGranularity: 'yearly' };
 }
 
-function bucketLabel(date: Date, granularity: TrendGranularity): { key: string; label: string } {
+function resolveRange(query: DashboardQuery, requests: NormalizedRequest[] = []): ResolvedRange {
+  return resolveGranularity(query, resolveWindow(query, requests));
+}
+
+function getFirstRequestDate(requests: NormalizedRequest[]): Date | null {
+  let firstTimestampMs = Number.POSITIVE_INFINITY;
+  for (const request of requests) {
+    if (request.timestampMs < firstTimestampMs) {
+      firstTimestampMs = request.timestampMs;
+    }
+  }
+
+  return Number.isFinite(firstTimestampMs) ? new Date(firstTimestampMs) : null;
+}
+
+function inRange(timestampMs: number, from: Date, to: Date): boolean {
+  return timestampMs >= from.getTime() && timestampMs <= to.getTime();
+}
+
+function startOfLocalDay(date: Date): Date {
+  const bucket = new Date(date);
+  bucket.setHours(0, 0, 0, 0);
+  return bucket;
+}
+
+function startOfLocalMonth(date: Date): Date {
+  const bucket = startOfLocalDay(date);
+  bucket.setDate(1);
+  return bucket;
+}
+
+function startOfLocalYear(date: Date): Date {
+  const bucket = startOfLocalDay(date);
+  bucket.setMonth(0, 1);
+  return bucket;
+}
+
+function startOfLocalWeek(date: Date): Date {
+  const bucket = startOfLocalDay(date);
+  const dayOffset = (bucket.getDay() + 6) % 7;
+  bucket.setDate(bucket.getDate() - dayOffset);
+  return bucket;
+}
+
+function startOfBucket(date: Date, granularity: TrendGranularity, range: DashboardWindow): Date {
   if (granularity === 'hourly') {
     const bucket = new Date(date);
     bucket.setMinutes(0, 0, 0);
-    return {
-      key: bucket.toISOString(),
-      label: new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false }).format(bucket),
-    };
+    return bucket;
+  }
+  if (granularity === 'daily') return startOfLocalDay(date);
+  if (granularity === 'monthly') return startOfLocalMonth(date);
+  if (granularity === 'yearly') return startOfLocalYear(date);
+
+  const weekStart = startOfLocalWeek(date);
+  return weekStart.getTime() < range.from.getTime() ? startOfLocalDay(range.from) : weekStart;
+}
+
+function formatBucketLabel(bucket: Date, granularity: TrendGranularity, range: DashboardWindow): string {
+  if (granularity === 'hourly') {
+    return new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false }).format(bucket);
   }
 
-  const bucket = new Date(date);
-  bucket.setHours(0, 0, 0, 0);
+  if (granularity === 'daily') {
+    return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(bucket);
+  }
+
+  if (granularity === 'monthly') {
+    return new Intl.DateTimeFormat('en-US', { month: 'short', year: 'numeric' }).format(bucket);
+  }
+
+  if (granularity === 'yearly') {
+    return new Intl.DateTimeFormat('en-US', { year: 'numeric' }).format(bucket);
+  }
+
+  const end = new Date(nextWeeklyBucketStart(bucket).getTime() - 1);
+  const clippedEnd = end.getTime() > range.to.getTime() ? range.to : end;
+  const month = new Intl.DateTimeFormat('en-US', { month: 'short' }).format(bucket);
+  const startDay = bucket.getDate();
+  const endDay = clippedEnd.getDate();
+  return `${month} ${startDay}-${endDay}`;
+}
+
+function emptyTrendPoint(bucket: Date, granularity: TrendGranularity, range: DashboardWindow): DashboardTrendPoint {
   return {
-    key: bucket.toISOString(),
-    label: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(bucket),
+    bucketStart: bucket.toISOString(),
+    label: formatBucketLabel(bucket, granularity, range),
+    requests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    totalTokens: 0,
+    cost: 0,
   };
 }
 
-function buildTrend(
-  requests: NormalizedRequest[],
-  from: Date,
-  to: Date,
-  granularity: TrendGranularity
-): DashboardTrendPoint[] {
-  const buckets = new Map<string, DashboardTrendPoint>();
-
-  for (const request of requests) {
-    if (!inRange(request.timestamp, from, to)) continue;
-    const bucket = bucketLabel(new Date(request.timestamp), granularity);
-    const current = buckets.get(bucket.key) ?? {
-      bucketStart: bucket.key,
-      label: bucket.label,
-      requests: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      totalTokens: 0,
-      cost: 0,
-    };
-    current.requests += request.requestCount;
-    current.inputTokens += request.inputTokens;
-    current.outputTokens += request.outputTokens;
-    current.cacheReadTokens += request.cacheReadTokens;
-    current.totalTokens += request.inputTokens + request.outputTokens + request.cacheReadTokens;
-    current.cost += request.cost;
-    buckets.set(bucket.key, current);
-  }
-
-  return Array.from(buckets.values()).sort((left, right) => left.bucketStart.localeCompare(right.bucketStart));
+function nextBucketStart(bucket: Date, granularity: TrendGranularity): Date {
+  const next = new Date(bucket);
+  if (granularity === 'hourly') next.setHours(next.getHours() + 1);
+  if (granularity === 'daily') next.setDate(next.getDate() + 1);
+  if (granularity === 'weekly') return nextWeeklyBucketStart(bucket);
+  if (granularity === 'monthly') next.setMonth(next.getMonth() + 1, 1);
+  if (granularity === 'yearly') next.setFullYear(next.getFullYear() + 1, 0, 1);
+  return next;
 }
 
-function buildKeyRows(
-  requests: NormalizedRequest[],
-  keyInfo: Map<string, NormalizedKeyInfo>,
-  from: Date,
-  to: Date
-): DashboardKeyRow[] {
+function nextWeeklyBucketStart(bucket: Date): Date {
+  const next = startOfLocalWeek(bucket);
+  next.setDate(next.getDate() + 7);
+  return next.getTime() <= bucket.getTime() ? new Date(bucket.getTime() + 7 * DAY_MS) : next;
+}
+
+function createTrendBuckets(range: ResolvedRange): Map<string, DashboardTrendPoint> {
+  const buckets = new Map<string, DashboardTrendPoint>();
+  let cursor = startOfBucket(range.from, range.resolvedGranularity, range);
+  const end = range.to.getTime();
+
+  while (cursor.getTime() <= end) {
+    const point = emptyTrendPoint(cursor, range.resolvedGranularity, range);
+    buckets.set(point.bucketStart, point);
+    cursor = nextBucketStart(cursor, range.resolvedGranularity);
+  }
+
+  return buckets;
+}
+
+function createConfiguredKeyRows(keyInfo: Map<string, NormalizedKeyInfo>): Map<string, DashboardKeyRow> {
   const rows = new Map<string, DashboardKeyRow>();
 
   for (const info of keyInfo.values()) {
@@ -616,70 +795,115 @@ function buildKeyRows(
     });
   }
 
-  for (const request of requests) {
-    if (!inRange(request.timestamp, from, to)) continue;
-    const info = keyInfo.get(request.keyId) ?? {
-      keyId: request.keyId,
-      fingerprint: request.keyId.replace('api-key:', ''),
-      maskedKey: redactToken(request.keyId),
-      displayName: request.keyId,
-      providerLabel: 'Discovered bucket',
-    };
-    const existing = rows.get(request.keyId) ?? {
-      id: request.keyId,
-      displayName: info.displayName,
-      fingerprint: info.fingerprint,
-      maskedKey: info.maskedKey,
-      providerLabel: info.providerLabel,
-      requests: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheTokens: 0,
-      totalTokens: 0,
-      cost: 0,
-      modelsUsed: [],
-      lastUsed: null,
-      sourceState: request.sourceState,
-    };
-
-    existing.requests += request.requestCount;
-    existing.inputTokens += request.inputTokens;
-    existing.outputTokens += request.outputTokens;
-    existing.cacheTokens += request.cacheReadTokens;
-    existing.totalTokens += request.inputTokens + request.outputTokens + request.cacheReadTokens;
-    existing.cost += request.cost;
-    existing.sourceState = request.sourceState;
-    existing.lastUsed =
-      !existing.lastUsed || new Date(request.timestamp) > new Date(existing.lastUsed)
-        ? request.timestamp
-        : existing.lastUsed;
-    if (!existing.modelsUsed.includes(request.model)) {
-      existing.modelsUsed.push(request.model);
-    }
-    rows.set(request.keyId, existing);
-  }
-
-  return Array.from(rows.values()).sort((left, right) => right.cost - left.cost || right.requests - left.requests);
+  return rows;
 }
 
-function buildModelRows(requests: NormalizedRequest[], from: Date, to: Date): DashboardModelRow[] {
-  const rows = new Map<string, DashboardModelRow>();
+function addRequestToTrend(point: DashboardTrendPoint, request: NormalizedRequest): void {
+  point.requests += request.requestCount;
+  point.inputTokens += request.inputTokens;
+  point.outputTokens += request.outputTokens;
+  point.cacheReadTokens += request.cacheReadTokens;
+  point.totalTokens += request.inputTokens + request.outputTokens + request.cacheReadTokens;
+  point.cost += request.cost;
+}
+
+function getRequestKeyRow(
+  rows: Map<string, DashboardKeyRow>,
+  keyInfo: Map<string, NormalizedKeyInfo>,
+  request: NormalizedRequest
+): DashboardKeyRow {
+  const info = keyInfo.get(request.keyId) ?? {
+    keyId: request.keyId,
+    fingerprint: request.keyId.replace('api-key:', ''),
+    maskedKey: redactToken(request.keyId),
+    displayName: request.keyId,
+    providerLabel: 'Discovered bucket',
+  };
+  const existing = rows.get(request.keyId);
+  if (existing) return existing;
+
+  const row: DashboardKeyRow = {
+    id: request.keyId,
+    displayName: info.displayName,
+    fingerprint: info.fingerprint,
+    maskedKey: info.maskedKey,
+    providerLabel: info.providerLabel,
+    requests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheTokens: 0,
+    totalTokens: 0,
+    cost: 0,
+    modelsUsed: [],
+    lastUsed: null,
+    sourceState: request.sourceState,
+  };
+  rows.set(request.keyId, row);
+  return row;
+}
+
+function aggregateDashboardData(
+  requests: NormalizedRequest[],
+  keyInfo: Map<string, NormalizedKeyInfo>,
+  range: ResolvedRange
+): AggregatedDashboardData {
+  const trendBuckets = createTrendBuckets(range);
+  const keyRows = createConfiguredKeyRows(keyInfo);
+  const modelRows = new Map<string, DashboardModelRow>();
 
   for (const request of requests) {
-    if (!inRange(request.timestamp, from, to)) continue;
-    const existing = rows.get(request.model) ?? {
+    if (!inRange(request.timestampMs, range.from, range.to)) continue;
+
+    const bucketDate = startOfBucket(new Date(request.timestampMs), range.resolvedGranularity, range);
+    const bucketKey = bucketDate.toISOString();
+    const trendPoint =
+      trendBuckets.get(bucketKey) ?? emptyTrendPoint(bucketDate, range.resolvedGranularity, range);
+    addRequestToTrend(trendPoint, request);
+    trendBuckets.set(bucketKey, trendPoint);
+
+    const keyRow = getRequestKeyRow(keyRows, keyInfo, request);
+    keyRow.requests += request.requestCount;
+    keyRow.inputTokens += request.inputTokens;
+    keyRow.outputTokens += request.outputTokens;
+    keyRow.cacheTokens += request.cacheReadTokens;
+    keyRow.totalTokens += request.inputTokens + request.outputTokens + request.cacheReadTokens;
+    keyRow.cost += request.cost;
+    keyRow.sourceState = request.sourceState;
+    keyRow.lastUsed =
+      !keyRow.lastUsed || request.timestampMs > new Date(keyRow.lastUsed).getTime()
+        ? request.timestamp
+        : keyRow.lastUsed;
+    if (!keyRow.modelsUsed.includes(request.model)) {
+      keyRow.modelsUsed.push(request.model);
+    }
+
+    const modelRow = modelRows.get(request.model) ?? {
       model: request.model,
       requests: 0,
       tokens: 0,
       cost: 0,
     };
-    existing.requests += request.requestCount;
-    existing.tokens += request.inputTokens + request.outputTokens + request.cacheReadTokens;
-    existing.cost += request.cost;
-    rows.set(request.model, existing);
+    modelRow.requests += request.requestCount;
+    modelRow.tokens += request.inputTokens + request.outputTokens + request.cacheReadTokens;
+    modelRow.cost += request.cost;
+    modelRows.set(request.model, modelRow);
   }
 
-  return Array.from(rows.values()).sort((left, right) => right.cost - left.cost);
+  const keys = Array.from(keyRows.values()).sort((left, right) => right.cost - left.cost || right.requests - left.requests);
+  const totalRequests = keys.reduce((sum, row) => sum + row.requests, 0);
+  const totalTokens = keys.reduce((sum, row) => sum + row.totalTokens, 0);
+  const totalCost = keys.reduce((sum, row) => sum + row.cost, 0);
+
+  return {
+    trend: Array.from(trendBuckets.values()).sort((left, right) => left.bucketStart.localeCompare(right.bucketStart)),
+    keys,
+    models: Array.from(modelRows.values()).sort((left, right) => right.cost - left.cost),
+    totalRequests,
+    totalTokens,
+    totalCost,
+    activeKeys: keys.filter((row) => row.requests > 0).length,
+    hasConfiguredRows: keys.some((row) => row.sourceState === 'config'),
+  };
 }
 
 function buildSourceBadges(mode: 'live' | 'fallback' | 'mixed', hasConfiguredRows: boolean): DashboardSourceBadge[] {
@@ -691,9 +915,12 @@ function buildSourceBadges(mode: 'live' | 'fallback' | 'mixed', hasConfiguredRow
   return badges;
 }
 
-export async function getDashboardPayload(query: DashboardQuery): Promise<DashboardPayload> {
+async function loadDashboardData(forceRefresh: boolean): Promise<LoadedDashboardData> {
+  if (!forceRefresh && sourceCache && Date.now() - sourceCache.loadedAt < SOURCE_CACHE_TTL_MS) {
+    return sourceCache.data;
+  }
+
   const ctx = await resolveContext();
-  const range = computeRange(query);
   let requests: NormalizedRequest[] = [];
   let mode: 'live' | 'fallback' | 'mixed' = 'live';
   let note: string | null = null;
@@ -725,17 +952,27 @@ export async function getDashboardPayload(query: DashboardQuery): Promise<Dashbo
     }
   }
 
-  const keyInfo = buildKeyInfo(ctx);
-  const keys = buildKeyRows(requests, keyInfo, range.from, range.to);
-  const models = buildModelRows(requests, range.from, range.to);
-  const trend = buildTrend(requests, range.from, range.to, range.granularity);
-  const activeKeys = keys.filter((row) => row.requests > 0).length;
-  const totalRequests = keys.reduce((sum, row) => sum + row.requests, 0);
-  const totalTokens = keys.reduce((sum, row) => sum + row.totalTokens, 0);
-  const totalCost = keys.reduce((sum, row) => sum + row.cost, 0);
-  const hasConfiguredRows = keys.some((row) => row.sourceState === 'config');
+  const data: LoadedDashboardData = {
+    ctx,
+    requests,
+    mode,
+    note,
+    fallback,
+    fallbackRequestCountForMode: fallbackRequests.length,
+  };
+  sourceCache = { loadedAt: Date.now(), data };
+  return data;
+}
 
-  if ((mode === 'fallback' || mode === 'mixed') && fallbackRequests.length === 0 && !fallback.hasSnapshotData) {
+export async function getDashboardPayload(query: DashboardQuery, forceRefresh = false): Promise<DashboardPayload> {
+  const { ctx, requests, mode, fallback, note: loadedNote, fallbackRequestCountForMode } = await loadDashboardData(forceRefresh);
+  const range = resolveRange(query, requests);
+  let note = loadedNote;
+
+  const keyInfo = buildKeyInfo(ctx);
+  const aggregate = aggregateDashboardData(requests, keyInfo, range);
+
+  if ((mode === 'fallback' || mode === 'mixed') && fallbackRequestCountForMode === 0 && !fallback.hasSnapshotData) {
     note =
       'Neither live management usage nor fallback snapshot data returned usable API-key requests.';
   }
@@ -746,23 +983,25 @@ export async function getDashboardPayload(query: DashboardQuery): Promise<Dashbo
       label: range.label,
       from: range.from.toISOString(),
       to: range.to.toISOString(),
-      granularity: range.granularity,
+      granularity: range.resolvedGranularity,
+      requestedGranularity: range.requestedGranularity,
+      resolvedGranularity: range.resolvedGranularity,
     },
     summary: {
-      totalRequests,
-      totalTokens,
-      totalCost,
-      activeKeys,
+      totalRequests: aggregate.totalRequests,
+      totalTokens: aggregate.totalTokens,
+      totalCost: aggregate.totalCost,
+      activeKeys: aggregate.activeKeys,
     },
     source: {
       mode,
       managementUrl: ctx.managementUrl,
       discoveredKeyCount: ctx.configuredKeys.length,
       note,
-      badges: buildSourceBadges(mode, hasConfiguredRows),
+      badges: buildSourceBadges(mode, aggregate.hasConfiguredRows),
     },
-    trend,
-    keys,
-    models,
+    trend: aggregate.trend,
+    keys: aggregate.keys,
+    models: aggregate.models,
   };
 }

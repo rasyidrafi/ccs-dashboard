@@ -68,19 +68,33 @@ import type {
   LimitsAccountRow,
   LimitsAlert,
   LimitsPayload,
+  TrendGranularityInput,
 } from "@/lib/types"
 
 const DEFAULT_PRESET: DatePreset = "today"
+const DEFAULT_GRANULARITY: TrendGranularityInput = "auto"
 const KEY_COLORS = ["var(--chart-1)", "var(--chart-2)", "var(--chart-3)", "var(--chart-4)", "var(--chart-5)"]
 const TALL_PANEL_HEIGHT = "h-[540px]"
 const TABLE_PANEL_HEIGHT = "h-[620px]"
 
-function buildQuery(preset: DatePreset, from: string, to: string): string {
+function buildQuery(
+  preset: DatePreset,
+  from: string,
+  to: string,
+  granularity: TrendGranularityInput,
+  refreshToken: number
+): string {
   const params = new URLSearchParams()
   params.set("preset", preset)
+  if (granularity !== "auto") {
+    params.set("granularity", granularity)
+  }
   if (preset === "custom") {
     if (from) params.set("from", from)
     if (to) params.set("to", to)
+  }
+  if (refreshToken > 0) {
+    params.set("refresh", String(refreshToken))
   }
   return params.toString()
 }
@@ -232,6 +246,8 @@ function DashboardOverview({
   setFrom,
   to,
   setTo,
+  granularity,
+  setGranularity,
 }: {
   dashboard: DashboardPayload | null
   preset: DatePreset
@@ -240,7 +256,14 @@ function DashboardOverview({
   setFrom: (value: string) => void
   to: string
   setTo: (value: string) => void
+  granularity: TrendGranularityInput
+  setGranularity: (value: TrendGranularityInput) => void
 }) {
+  const granularityOptions = getGranularityOptions(preset)
+  const selectedGranularity = granularityOptions.some((option) => option.value === granularity)
+    ? granularity
+    : DEFAULT_GRANULARITY
+
   return (
     <section className="grid gap-4 xl:grid-cols-[minmax(0,1.3fr)_380px]">
       <Card>
@@ -256,7 +279,7 @@ function DashboardOverview({
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             <MetricItem label="Range" value={dashboard?.range.label ?? "Loading"} />
             <MetricItem label="Mode" value={dashboard?.source.mode ?? "Loading"} />
-            <MetricItem label="Granularity" value={dashboard?.range.granularity ?? "Loading"} />
+            <MetricItem label="Granularity" value={dashboard?.range.resolvedGranularity ?? "Loading"} />
             <MetricItem label="Updated" value={dashboard ? formatDateTime(dashboard.generatedAt) : "Loading"} />
           </div>
         </CardContent>
@@ -303,15 +326,72 @@ function DashboardOverview({
             <DatePicker value={from} onChange={setFrom} label="From date" />
             <DatePicker value={to} onChange={setTo} label="To date" />
           </div>
+          <div className="flex flex-col gap-2">
+            <div className="text-sm font-medium">Chart grouping</div>
+            <Select value={selectedGranularity} onValueChange={(value) => setGranularity(value as TrendGranularityInput)}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  {granularityOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </div>
         </CardContent>
         <CardFooter className="border-t text-xs text-muted-foreground">
           <p>
             Custom dates apply only when <span className="font-medium text-foreground">Custom</span> is selected.
+            Auto grouping follows the selected window.
           </p>
         </CardFooter>
       </Card>
     </section>
   )
+}
+
+function getGranularityOptions(preset: DatePreset): Array<{ value: TrendGranularityInput; label: string }> {
+  if (preset === "month") {
+    return [
+      { value: "auto", label: "Auto (daily)" },
+      { value: "daily", label: "Daily" },
+      { value: "weekly", label: "Weekly" },
+    ]
+  }
+
+  if (preset === "custom") {
+    return [
+      { value: "auto", label: "Auto" },
+      { value: "daily", label: "Daily" },
+      { value: "monthly", label: "Monthly" },
+      { value: "yearly", label: "Yearly" },
+    ]
+  }
+
+  if (preset === "today") {
+    return [
+      { value: "auto", label: "Auto (hourly)" },
+      { value: "hourly", label: "Hourly" },
+    ]
+  }
+
+  if (preset === "year" || preset === "all") {
+    return [
+      { value: "auto", label: preset === "all" ? "Auto" : "Auto (monthly)" },
+      { value: "monthly", label: "Monthly" },
+      { value: "yearly", label: "Yearly" },
+    ]
+  }
+
+  return [
+    { value: "auto", label: "Auto (daily)" },
+    { value: "daily", label: "Daily" },
+  ]
 }
 
 function DatePicker({
@@ -642,6 +722,8 @@ function DashboardView({
   setFrom,
   to,
   setTo,
+  granularity,
+  setGranularity,
 }: {
   dashboard: DashboardPayload | null
   dashboardLoading: boolean
@@ -652,6 +734,8 @@ function DashboardView({
   setFrom: (value: string) => void
   to: string
   setTo: (value: string) => void
+  granularity: TrendGranularityInput
+  setGranularity: (value: TrendGranularityInput) => void
 }) {
   return (
     <div className="space-y-4">
@@ -663,6 +747,8 @@ function DashboardView({
         setFrom={setFrom}
         to={to}
         setTo={setTo}
+        granularity={granularity}
+        setGranularity={setGranularity}
       />
 
       {dashboard?.source.note ? (
@@ -947,6 +1033,7 @@ export function DashboardClient() {
   const [preset, setPreset] = useState<DatePreset>(DEFAULT_PRESET)
   const [from, setFrom] = useState("")
   const [to, setTo] = useState("")
+  const [granularity, setGranularity] = useState<TrendGranularityInput>(DEFAULT_GRANULARITY)
   const [refreshToken, setRefreshToken] = useState(0)
 
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null)
@@ -957,12 +1044,18 @@ export function DashboardClient() {
   const [limitsError, setLimitsError] = useState<string | null>(null)
   const [limitsLoading, setLimitsLoading] = useState(false)
 
+  const dashboardFrom = preset === "custom" ? from : ""
+  const dashboardTo = preset === "custom" ? to : ""
+  const dashboardGranularity = getGranularityOptions(preset).some((option) => option.value === granularity)
+    ? granularity
+    : DEFAULT_GRANULARITY
+
   useEffect(() => {
     const controller = new AbortController()
     setDashboardLoading(true)
     setDashboardError(null)
 
-    fetch(`/api/dashboard?${buildQuery(preset, from, to)}&refresh=${refreshToken}`, {
+    fetch(`/api/dashboard?${buildQuery(preset, dashboardFrom, dashboardTo, dashboardGranularity, refreshToken)}`, {
       cache: "no-store",
       signal: controller.signal,
     })
@@ -985,7 +1078,7 @@ export function DashboardClient() {
       })
 
     return () => controller.abort()
-  }, [preset, from, to, refreshToken])
+  }, [preset, dashboardFrom, dashboardTo, dashboardGranularity, refreshToken])
 
   useEffect(() => {
     if (view !== "limits" && limits) return
@@ -1064,6 +1157,8 @@ export function DashboardClient() {
           setFrom={setFrom}
           to={to}
           setTo={setTo}
+          granularity={granularity}
+          setGranularity={setGranularity}
         />
       ) : (
         <LimitsView limits={limits} limitsLoading={limitsLoading} limitsError={limitsError} />

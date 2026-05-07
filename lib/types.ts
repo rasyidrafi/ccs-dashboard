@@ -1,11 +1,13 @@
 export type DatePreset = 'all' | 'today' | 'week' | 'month' | 'year' | 'custom';
-export type TrendGranularity = 'hourly' | 'daily';
+export type TrendGranularity = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'yearly';
+export type TrendGranularityInput = TrendGranularity | 'auto';
 export type RowSourceState = 'live' | 'fallback' | 'config';
 
 export interface DashboardQuery {
   preset: DatePreset;
   from?: string;
   to?: string;
+  granularity?: TrendGranularityInput;
 }
 
 export interface DashboardSourceBadge {
@@ -55,6 +57,8 @@ export interface DashboardPayload {
     from: string;
     to: string;
     granularity: TrendGranularity;
+    requestedGranularity: TrendGranularityInput | null;
+    resolvedGranularity: TrendGranularity;
   };
   summary: {
     totalRequests: number;

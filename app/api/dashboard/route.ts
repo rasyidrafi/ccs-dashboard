@@ -4,10 +4,17 @@ import { getDashboardPayload, parseDashboardQuery } from '@/lib/dashboard-servic
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
+let lastRefreshToken: string | null = null;
+
 export async function GET(request: NextRequest) {
   try {
     const query = parseDashboardQuery(request.nextUrl.searchParams);
-    const payload = await getDashboardPayload(query);
+    const refreshToken = request.nextUrl.searchParams.get('refresh');
+    const forceRefresh = refreshToken !== null && refreshToken !== lastRefreshToken;
+    if (forceRefresh) {
+      lastRefreshToken = refreshToken;
+    }
+    const payload = await getDashboardPayload(query, forceRefresh);
     return NextResponse.json(payload, {
       headers: {
         'Cache-Control': 'no-store',
