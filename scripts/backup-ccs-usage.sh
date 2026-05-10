@@ -78,6 +78,9 @@ capture_live_api_keys
 
 copy_if_exists "$CCS_DIR/cache/cliproxy-usage/latest.json" "cliproxy-latest.json"
 copy_if_exists "$CCS_DIR/cache/ccs-dashboard-usage-v1/latest.json" "ccs-dashboard-latest.json"
+copy_if_exists "$CCS_DIR/cache/ccs-dashboard-usage-v1/usage.db" "ccs-dashboard-usage.db"
+copy_if_exists "$CCS_DIR/cache/ccs-dashboard-usage-v1/usage.db-wal" "ccs-dashboard-usage.db-wal"
+copy_if_exists "$CCS_DIR/cache/ccs-dashboard-usage-v1/usage.db-shm" "ccs-dashboard-usage.db-shm"
 copy_if_exists "$CCS_DIR/cache/usage.json" "usage.json"
 copy_if_exists "$CCS_DIR/cache/codex-native-usage-v1.json" "codex-native-usage-v1.json"
 

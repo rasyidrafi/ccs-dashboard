@@ -3,6 +3,13 @@ import path from 'node:path';
 import { copyFile, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import YAML from 'yaml';
 import {
+  getUsageStore,
+  type UsageKeyAggregate,
+  type UsageStoreRequest,
+  type UsageSummary,
+  type UsageTrendBucket,
+} from '@/lib/usage-store';
+import {
   buildStablePublicId,
   redactSensitiveText,
   redactToken,
@@ -126,6 +133,7 @@ interface NormalizedRequest {
   cacheReadTokens: number;
   requestCount: number;
   cost: number;
+  failed: boolean;
   sourceState: Exclude<RowSourceState, 'config'>;
 }
 
@@ -140,6 +148,7 @@ interface NormalizedKeyInfo {
 interface LoadedRequests {
   requests: NormalizedRequest[];
   hasSnapshotData: boolean;
+  storeAvailable: boolean;
 }
 
 interface DashboardWindow {
@@ -160,6 +169,7 @@ interface LoadedDashboardData {
   note: string | null;
   fallback: LoadedRequests;
   fallbackRequestCountForMode: number;
+  storeAvailable: boolean;
 }
 
 interface AggregatedDashboardData {
@@ -431,6 +441,7 @@ async function fetchLiveRequests(
           cacheReadTokens,
           requestCount: 1,
           cost: calculateCost(model, inputTokens, outputTokens, cacheReadTokens),
+          failed: detail.failed === true,
           sourceState: 'live',
         });
         if (request) requests.push(request);
@@ -533,7 +544,7 @@ function snapshotDetailFromRequest(request: NormalizedRequest): SnapshotDetail {
     cacheReadTokens: request.cacheReadTokens,
     requestCount: request.requestCount,
     cost: request.cost,
-    failed: false,
+    failed: request.failed,
   };
 }
 
@@ -621,6 +632,7 @@ async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
       cacheReadTokens: detail.cacheReadTokens,
       requestCount: detail.requestCount,
       cost: detail.cost,
+      failed: detail.failed,
       sourceState: 'fallback',
     });
     if (request) requests.push(request);
@@ -629,7 +641,55 @@ async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
   return {
     requests,
     hasSnapshotData: snapshotDetails.length > 0,
+    storeAvailable: false,
   };
+}
+
+function toUsageStoreRequest(request: NormalizedRequest): UsageStoreRequest {
+  return {
+    keyId: request.keyId,
+    model: request.model,
+    timestamp: request.timestamp,
+    timestampMs: request.timestampMs,
+    inputTokens: request.inputTokens,
+    outputTokens: request.outputTokens,
+    cacheReadTokens: request.cacheReadTokens,
+    requestCount: request.requestCount,
+    cost: request.cost,
+    failed: request.failed,
+    sourceState: request.sourceState,
+  };
+}
+
+async function loadStoredRequests(
+  ccsDir: string,
+  fallback: LoadedRequests
+): Promise<LoadedRequests> {
+  try {
+    const store = await getUsageStore(ccsDir);
+    const storedCount = store.countEvents();
+    if (fallback.requests.length > 0 && storedCount < fallback.requests.length) {
+      store.insertRequests(fallback.requests.map(toUsageStoreRequest));
+    }
+
+    return {
+      requests: fallback.requests,
+      hasSnapshotData: Math.max(storedCount, fallback.requests.length) > 0,
+      storeAvailable: true,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+async function persistStoredRequests(ccsDir: string, requests: NormalizedRequest[]): Promise<void> {
+  if (requests.length === 0) return;
+  try {
+    const store = await getUsageStore(ccsDir);
+    store.insertRequests(requests.map(toUsageStoreRequest));
+  } catch {
+    // SQLite is a durability layer, not a hard dependency for serving data.
+  }
 }
 
 function requestIdentity(request: NormalizedRequest): string {
@@ -641,6 +701,7 @@ function requestIdentity(request: NormalizedRequest): string {
     request.outputTokens,
     request.cacheReadTokens,
     request.requestCount,
+    request.failed ? '1' : '0',
   ].join('|');
 }
 
@@ -986,6 +1047,92 @@ function createConfiguredKeyRows(keyInfo: Map<string, NormalizedKeyInfo>): Map<s
   return rows;
 }
 
+function mergeAggregatedKeyRows(
+  configuredRows: Map<string, DashboardKeyRow>,
+  keyInfo: Map<string, NormalizedKeyInfo>,
+  aggregates: UsageKeyAggregate[]
+): DashboardKeyRow[] {
+  const rows = new Map(configuredRows);
+
+  for (const aggregate of aggregates) {
+    const info = keyInfo.get(aggregate.keyId) ?? {
+      keyId: aggregate.keyId,
+      fingerprint: aggregate.keyId.replace('api-key:', ''),
+      maskedKey: redactToken(aggregate.keyId),
+      displayName: aggregate.keyId,
+      providerLabel: 'Discovered bucket',
+    };
+
+    rows.set(aggregate.keyId, {
+      id: aggregate.keyId,
+      displayName: info.displayName,
+      fingerprint: info.fingerprint,
+      maskedKey: info.maskedKey,
+      providerLabel: info.providerLabel,
+      requests: aggregate.requests,
+      inputTokens: aggregate.inputTokens,
+      outputTokens: aggregate.outputTokens,
+      cacheTokens: aggregate.cacheTokens,
+      totalTokens: aggregate.totalTokens,
+      cost: aggregate.cost,
+      modelsUsed: aggregate.modelsUsed,
+      lastUsed: aggregate.lastUsed,
+      sourceState: aggregate.sourceState,
+    });
+  }
+
+  return Array.from(rows.values()).sort(
+    (left, right) => right.cost - left.cost || right.requests - left.requests
+  );
+}
+
+function applyTrendAggregates(
+  range: ResolvedRange,
+  rows: UsageTrendBucket[]
+): DashboardTrendPoint[] {
+  const buckets = createTrendBuckets(range);
+
+  for (const row of rows) {
+    const bucketDate = new Date(row.bucketStartLocal);
+    if (!Number.isFinite(bucketDate.getTime())) continue;
+    const bucketKey = bucketDate.toISOString();
+    const point =
+      buckets.get(bucketKey) ?? emptyTrendPoint(bucketDate, range.resolvedGranularity, range);
+    point.requests = row.requests;
+    point.inputTokens = row.inputTokens;
+    point.outputTokens = row.outputTokens;
+    point.cacheReadTokens = row.cacheReadTokens;
+    point.totalTokens = row.inputTokens + row.outputTokens + row.cacheReadTokens;
+    point.cost = row.totalCost;
+    buckets.set(bucketKey, point);
+  }
+
+  return Array.from(buckets.values()).sort((left, right) =>
+    left.bucketStart.localeCompare(right.bucketStart)
+  );
+}
+
+function buildAggregateFromStore(
+  keyInfo: Map<string, NormalizedKeyInfo>,
+  range: ResolvedRange,
+  summary: UsageSummary,
+  trendRows: UsageTrendBucket[],
+  keyRows: UsageKeyAggregate[],
+  modelRows: DashboardModelRow[]
+): AggregatedDashboardData {
+  const keys = mergeAggregatedKeyRows(createConfiguredKeyRows(keyInfo), keyInfo, keyRows);
+  return {
+    trend: applyTrendAggregates(range, trendRows),
+    keys,
+    models: modelRows,
+    totalRequests: summary.totalRequests,
+    totalTokens: summary.totalTokens,
+    totalCost: summary.totalCost,
+    activeKeys: summary.activeKeys,
+    hasConfiguredRows: keyInfo.size > 0,
+  };
+}
+
 function addRequestToTrend(point: DashboardTrendPoint, request: NormalizedRequest): void {
   point.requests += request.requestCount;
   point.inputTokens += request.inputTokens;
@@ -1097,8 +1244,8 @@ function aggregateDashboardData(
 function buildSourceBadges(mode: 'live' | 'fallback' | 'mixed', hasConfiguredRows: boolean): DashboardSourceBadge[] {
   const badges: DashboardSourceBadge[] = [];
   if (mode === 'live') badges.push({ label: 'Live API', kind: 'live' });
-  if (mode === 'fallback') badges.push({ label: 'Fallback snapshot', kind: 'fallback' });
-  if (mode === 'mixed') badges.push({ label: 'Live + fallback', kind: 'warning' });
+  if (mode === 'fallback') badges.push({ label: 'Stored history', kind: 'fallback' });
+  if (mode === 'mixed') badges.push({ label: 'Live + stored history', kind: 'warning' });
   if (hasConfiguredRows) badges.push({ label: 'Config-discovered', kind: 'config' });
   return badges;
 }
@@ -1112,27 +1259,38 @@ async function loadDashboardData(forceRefresh: boolean): Promise<LoadedDashboard
   let requests: NormalizedRequest[] = [];
   let mode: 'live' | 'fallback' | 'mixed' = 'live';
   let note: string | null = null;
-  const fallback = await loadFallbackRequests(ctx.ccsDir);
+  const jsonFallback = await loadFallbackRequests(ctx.ccsDir);
+  const fallback = await loadStoredRequests(ctx.ccsDir, jsonFallback);
+  const storeAvailable = fallback.storeAvailable;
 
   try {
     const live = await fetchLiveRequests(ctx);
-    const merged = mergeRequests(fallback.requests, live.requests);
-    requests = merged.requests;
-    if (fallback.requests.length > 0) {
-      mode = 'mixed';
-      note = merged.usedFallbackHistory
-        ? 'Dashboard history is merged from persisted ~/.ccs cache plus live management data. Live data takes precedence when duplicate events overlap.'
-        : 'Live management data matched the persisted history snapshot. Duplicate events were deduplicated automatically.';
+    await persistStoredRequests(ctx.ccsDir, live.requests);
+    if (storeAvailable) {
+      requests = live.requests;
+      mode = fallback.hasSnapshotData ? 'mixed' : 'live';
+      note = fallback.hasSnapshotData
+        ? 'Dashboard history is served from persisted SQLite data, with new live events written into SQLite before the response is generated.'
+        : 'Live management data was written into the persisted SQLite history store before the response was generated.';
+    } else {
+      const merged = mergeRequests(fallback.requests, live.requests);
+      requests = merged.requests;
+      if (fallback.requests.length > 0) {
+        mode = 'mixed';
+        note = merged.usedFallbackHistory
+          ? 'Dashboard history is merged from persisted SQLite/JSON history plus live management data. Live data takes precedence when duplicate events overlap.'
+          : 'Live management data matched the persisted history store. Duplicate events were deduplicated automatically.';
+      }
     }
   } catch {
-    requests = fallback.requests;
+    requests = storeAvailable ? [] : fallback.requests;
     mode = 'fallback';
     note =
-      'Live management data was unavailable. This view is using ~/.ccs/cache/cliproxy-usage/latest.json as fallback.';
+      'Live management data was unavailable. This view is using persisted SQLite history as fallback.';
   }
 
   const fallbackRequests = mode === 'fallback' ? requests : fallback.requests;
-  if (requests.length === 0 && fallback.requests.length > 0) {
+  if (!storeAvailable && requests.length === 0 && fallback.requests.length > 0) {
     requests = fallback.requests;
     if (mode === 'live') {
       mode = 'mixed';
@@ -1147,6 +1305,7 @@ async function loadDashboardData(forceRefresh: boolean): Promise<LoadedDashboard
     note,
     fallback,
     fallbackRequestCountForMode: fallbackRequests.length,
+    storeAvailable,
   };
 
   await persistDashboardHistory(ctx.ccsDir, requests);
@@ -1156,16 +1315,72 @@ async function loadDashboardData(forceRefresh: boolean): Promise<LoadedDashboard
 }
 
 export async function getDashboardPayload(query: DashboardQuery, forceRefresh = false): Promise<DashboardPayload> {
-  const { ctx, requests, mode, fallback, note: loadedNote, fallbackRequestCountForMode } = await loadDashboardData(forceRefresh);
-  const range = resolveRange(query, requests);
+  const {
+    ctx,
+    requests,
+    mode,
+    fallback,
+    note: loadedNote,
+    fallbackRequestCountForMode,
+    storeAvailable,
+  } = await loadDashboardData(forceRefresh);
   let note = loadedNote;
 
   const keyInfo = buildKeyInfo(ctx);
-  const aggregate = aggregateDashboardData(requests, keyInfo, range);
+  let aggregate: AggregatedDashboardData;
+  let range: ResolvedRange;
+
+  if (storeAvailable) {
+    try {
+      const store = await getUsageStore(ctx.ccsDir);
+      const firstRequestMs = store.getFirstTimestampMs();
+      const now = new Date();
+      const startOfToday = new Date(now);
+      startOfToday.setHours(0, 0, 0, 0);
+
+      if (query.preset === 'all') {
+        range = resolveGranularity(query, {
+          from: firstRequestMs ? new Date(firstRequestMs) : now,
+          to: now,
+          label: 'All time',
+        });
+      } else if (query.preset === 'year') {
+        const startOfYear = new Date(startOfToday);
+        startOfYear.setMonth(0, 1);
+        const firstInYearMs = store.getFirstTimestampMsInRange(startOfYear.getTime(), now.getTime());
+        range = resolveGranularity(query, {
+          from: firstInYearMs
+            ? startOfPreviousMonthOrYearStart(new Date(firstInYearMs), startOfYear)
+            : startOfYear,
+          to: now,
+          label: 'This year',
+        });
+      } else {
+        range = resolveRange(query);
+      }
+
+      const fromMs = range.from.getTime();
+      const toMs = range.to.getTime();
+      const summary = store.summarizeRange(fromMs, toMs);
+      const trendRows = store.listTrendBuckets(fromMs, toMs, range.resolvedGranularity);
+      const keyRows = store.listKeyAggregates(fromMs, toMs);
+      const modelRows = store
+        .listModelAggregates(fromMs, toMs)
+        .map((row) => ({ model: row.model, requests: row.requests, tokens: row.tokens, cost: row.cost }));
+
+      aggregate = buildAggregateFromStore(keyInfo, range, summary, trendRows, keyRows, modelRows);
+    } catch {
+      range = resolveRange(query, requests);
+      aggregate = aggregateDashboardData(requests, keyInfo, range);
+    }
+  } else {
+    range = resolveRange(query, requests);
+    aggregate = aggregateDashboardData(requests, keyInfo, range);
+  }
 
   if ((mode === 'fallback' || mode === 'mixed') && fallbackRequestCountForMode === 0 && !fallback.hasSnapshotData) {
     note =
-      'Neither live management usage nor fallback snapshot data returned usable API-key requests.';
+      'Neither live management usage nor persisted history returned usable API-key requests.';
   }
 
   return {
