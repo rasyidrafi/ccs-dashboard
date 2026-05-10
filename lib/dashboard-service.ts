@@ -1,6 +1,6 @@
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import YAML from 'yaml';
 import {
   buildStablePublicId,
@@ -25,6 +25,7 @@ const DEFAULT_MANAGEMENT_SECRET = 'ccs';
 const DEFAULT_PORT = 8097;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SOURCE_CACHE_TTL_MS = 30_000;
+const DASHBOARD_HISTORY_VERSION = 1;
 
 interface UnifiedConfig {
   cliproxy?: {
@@ -95,6 +96,9 @@ interface SnapshotDetail {
 }
 
 interface SnapshotPayload {
+  version?: number;
+  timestamp?: number;
+  generatedAt?: string;
   details?: SnapshotDetail[];
 }
 
@@ -170,6 +174,7 @@ interface AggregatedDashboardData {
 }
 
 let sourceCache: { loadedAt: number; data: LoadedDashboardData } | null = null;
+let historyBootstrapPromise: Promise<void> | null = null;
 
 const PRICING: Record<
   string,
@@ -455,13 +460,157 @@ async function fetchLiveRequests(
   return { requests, discoveredConfiguredKeys };
 }
 
+function getCoreSnapshotPath(ccsDir: string): string {
+  return path.join(ccsDir, 'cache', 'cliproxy-usage', 'latest.json');
+}
+
+function getDashboardHistoryDir(ccsDir: string): string {
+  return path.join(ccsDir, 'cache', 'ccs-dashboard-usage-v1');
+}
+
+function getDashboardSnapshotPath(ccsDir: string): string {
+  return path.join(getDashboardHistoryDir(ccsDir), 'latest.json');
+}
+
+function getDashboardArchiveDir(ccsDir: string): string {
+  return path.join(getDashboardHistoryDir(ccsDir), 'archive');
+}
+
+async function loadSnapshotDetails(filePath: string): Promise<SnapshotDetail[]> {
+  try {
+    const text = await readUtf8(filePath);
+    const snapshot = parseYamlText<SnapshotPayload>(text);
+    return Array.isArray(snapshot?.details) ? snapshot.details : [];
+  } catch {
+    return [];
+  }
+}
+
+function snapshotDetailIdentity(detail: SnapshotDetail): string {
+  return [
+    detail.provider,
+    detail.model,
+    detail.timestamp,
+    detail.inputTokens,
+    detail.outputTokens,
+    detail.cacheReadTokens,
+    detail.requestCount,
+    detail.failed ? '1' : '0',
+  ].join('|');
+}
+
+function mergeSnapshotDetails(
+  existing: SnapshotDetail[],
+  incoming: SnapshotDetail[]
+): SnapshotDetail[] {
+  const merged = new Map<string, SnapshotDetail>();
+  for (const detail of existing) {
+    merged.set(snapshotDetailIdentity(detail), detail);
+  }
+  for (const detail of incoming) {
+    merged.set(snapshotDetailIdentity(detail), detail);
+  }
+  return Array.from(merged.values()).sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+}
+
+function snapshotDetailsEqual(left: SnapshotDetail[], right: SnapshotDetail[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (snapshotDetailIdentity(left[index]) !== snapshotDetailIdentity(right[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function snapshotDetailFromRequest(request: NormalizedRequest): SnapshotDetail {
+  return {
+    provider: request.keyId,
+    model: request.model,
+    timestamp: request.timestamp,
+    inputTokens: request.inputTokens,
+    outputTokens: request.outputTokens,
+    cacheReadTokens: request.cacheReadTokens,
+    requestCount: request.requestCount,
+    cost: request.cost,
+    failed: false,
+  };
+}
+
+async function writeJsonAtomic(filePath: string, payload: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, JSON.stringify(payload), 'utf8');
+  await rename(tempPath, filePath);
+}
+
+async function bootstrapHistoryArchive(ccsDir: string): Promise<void> {
+  if (historyBootstrapPromise) {
+    await historyBootstrapPromise;
+    return;
+  }
+
+  historyBootstrapPromise = (async () => {
+    const archiveDir = getDashboardArchiveDir(ccsDir);
+    await mkdir(archiveDir, { recursive: true });
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const startupCopies = [
+      { source: getCoreSnapshotPath(ccsDir), target: `${stamp}-startup-core-cliproxy-latest.json` },
+      { source: getDashboardSnapshotPath(ccsDir), target: `${stamp}-startup-dashboard-latest.json` },
+    ];
+
+    for (const copy of startupCopies) {
+      try {
+        await copyFile(copy.source, path.join(archiveDir, copy.target));
+      } catch {
+        // Best-effort startup backups should never block dashboard reads.
+      }
+    }
+  })();
+
+  await historyBootstrapPromise;
+}
+
+async function persistDashboardHistory(ccsDir: string, requests: NormalizedRequest[]): Promise<void> {
+  if (requests.length === 0) return;
+
+  await bootstrapHistoryArchive(ccsDir);
+
+  const snapshotPath = getDashboardSnapshotPath(ccsDir);
+  const archiveDir = getDashboardArchiveDir(ccsDir);
+  const existingDetails = await loadSnapshotDetails(snapshotPath);
+  const incomingDetails = requests.map(snapshotDetailFromRequest);
+  const mergedDetails = mergeSnapshotDetails(existingDetails, incomingDetails);
+
+  if (snapshotDetailsEqual(existingDetails, mergedDetails)) {
+    return;
+  }
+
+  const snapshot = {
+    version: DASHBOARD_HISTORY_VERSION,
+    timestamp: Date.now(),
+    generatedAt: new Date().toISOString(),
+    details: mergedDetails,
+  };
+
+  await writeJsonAtomic(snapshotPath, snapshot);
+
+  const archivePath = path.join(
+    archiveDir,
+    `${new Date(snapshot.timestamp).toISOString().replace(/[:.]/g, '-')}-snapshot.json`
+  );
+  await writeJsonAtomic(archivePath, snapshot);
+}
+
 async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
-  const snapshotPath = path.join(ccsDir, 'cache', 'cliproxy-usage', 'latest.json');
-  const text = await readUtf8(snapshotPath);
-  const snapshot = parseYamlText<SnapshotPayload>(text);
+  const snapshotDetails = mergeSnapshotDetails(
+    await loadSnapshotDetails(getCoreSnapshotPath(ccsDir)),
+    await loadSnapshotDetails(getDashboardSnapshotPath(ccsDir))
+  );
   const requests: NormalizedRequest[] = [];
 
-  for (const detail of snapshot?.details ?? []) {
+  for (const detail of snapshotDetails) {
     if (!detail.provider.startsWith('api-key:')) continue;
     const request = normalizeRequest({
       keyId: detail.provider,
@@ -479,7 +628,7 @@ async function loadFallbackRequests(ccsDir: string): Promise<LoadedRequests> {
 
   return {
     requests,
-    hasSnapshotData: Array.isArray(snapshot?.details) && snapshot.details.length > 0,
+    hasSnapshotData: snapshotDetails.length > 0,
   };
 }
 
@@ -999,6 +1148,9 @@ async function loadDashboardData(forceRefresh: boolean): Promise<LoadedDashboard
     fallback,
     fallbackRequestCountForMode: fallbackRequests.length,
   };
+
+  await persistDashboardHistory(ctx.ccsDir, requests);
+
   sourceCache = { loadedAt: Date.now(), data };
   return data;
 }
