@@ -1,19 +1,25 @@
 "use client"
 
-import { startTransition, useEffect, useState } from "react"
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Activity,
   AlertTriangle,
   CalendarDays,
   ChartColumnBig,
   Clock3,
+  FileText,
   KeyRound,
   RefreshCw,
+  Search,
+  Shield,
   ShieldAlert,
+  Terminal,
   Wallet,
 } from "lucide-react"
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, XAxis, YAxis } from "recharts"
+import { useVirtualizer } from "@tanstack/react-virtual"
 
+import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -35,6 +41,14 @@ import {
   ChartTooltip,
   ChartTooltipContent,
 } from "@/components/ui/chart"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Progress } from "@/components/ui/progress"
 import {
@@ -68,6 +82,11 @@ import type {
   LimitsAccountRow,
   LimitsAlert,
   LimitsPayload,
+  LogEntry,
+  MonitorPayload,
+  LogSourceType,
+  AllLogsPayload,
+  ConversationEntry,
   TrendGranularityInput,
 } from "@/lib/types"
 
@@ -178,6 +197,19 @@ function getStateBadgeVariant(
       return "outline"
     default:
       return "destructive"
+  }
+}
+
+function getLogLevelVariant(level: LogEntry["level"]): "secondary" | "outline" | "destructive" | "default" {
+  switch (level) {
+    case "info":
+      return "secondary"
+    case "warn":
+      return "outline"
+    case "error":
+      return "destructive"
+    default:
+      return "default"
   }
 }
 
@@ -1035,6 +1067,440 @@ function LimitsView({
   )
 }
 
+function LogDetailDialog({ log, open, onOpenChange }: { log: LogEntry | ConversationEntry | null; open: boolean; onOpenChange: (open: boolean) => void }) {
+  if (!log) return null
+
+  const isConversation = 'prompt' in log
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-4xl max-h-[90vh] flex flex-col">
+        <DialogHeader>
+          <div className="flex items-center gap-2">
+            {!isConversation && <Badge variant={getLogLevelVariant((log as LogEntry).level)} className="uppercase">{(log as LogEntry).level}</Badge>}
+            {isConversation && <Badge variant="secondary" className="uppercase">Conversation</Badge>}
+            <DialogTitle>{isConversation ? (log as ConversationEntry).model : (log as LogEntry).event}</DialogTitle>
+          </div>
+          <DialogDescription>
+            {isConversation ? (log as ConversationEntry).apiKey : (log as LogEntry).source} — {formatDateTime(log.timestamp)}
+          </DialogDescription>
+        </DialogHeader>
+        
+        <div className="flex-1 overflow-hidden">
+          {isConversation ? (
+            <div className="flex flex-col gap-6 h-full">
+              <div className="flex flex-col gap-2">
+                <span className="text-xs font-bold uppercase text-muted-foreground">Prompt / Request</span>
+                <ScrollArea className="h-[250px] rounded-lg bg-muted p-4 border">
+                  <pre className="whitespace-pre-wrap text-sm">{(log as ConversationEntry).prompt}</pre>
+                </ScrollArea>
+              </div>
+              <div className="flex flex-col gap-2">
+                <span className="text-xs font-bold uppercase text-muted-foreground">AI Response</span>
+                <ScrollArea className="h-[250px] rounded-lg bg-primary/5 p-4 border border-primary/20">
+                  <pre className="whitespace-pre-wrap text-sm">{(log as ConversationEntry).response || 'No response captured yet.'}</pre>
+                </ScrollArea>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4">
+              <div className="rounded-lg bg-muted p-4">
+                <p className="text-sm font-medium">{(log as LogEntry).message}</p>
+              </div>
+              <ScrollArea className="h-[400px] rounded-md border bg-black/5 p-4 font-mono text-xs">
+                <pre className="whitespace-pre-wrap">{(log as any).raw || JSON.stringify(log, (k, v) => k === 'raw' ? undefined : v, 2)}</pre>
+              </ScrollArea>
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function MonitorView({
+  monitor,
+  monitorLoading,
+  monitorError,
+  sourceType,
+  setSourceType,
+  selectedFile,
+  setSelectedFile,
+  conversations,
+  conversationsLoading,
+  totalConversations,
+  fetchMoreConversations,
+  syncLogs,
+  classifyLogs,
+  uniqueApiKeys,
+  filterApiKey,
+  setFilterApiKey,
+}: {
+  monitor: MonitorPayload | null
+  monitorLoading: boolean
+  monitorError: string | null
+  sourceType: LogSourceType | 'history'
+  setSourceType: (value: LogSourceType | 'history') => void
+  selectedFile: string
+  setSelectedFile: (value: string) => void
+  conversations: ConversationEntry[]
+  conversationsLoading: boolean
+  totalConversations: number
+  fetchMoreConversations: () => void
+  syncLogs: () => void
+  classifyLogs: () => void
+  uniqueApiKeys: string[]
+  filterApiKey: string
+  setFilterApiKey: (value: string) => void
+}) {
+  const [filter, setFilter] = useState("")
+  const [selectedLog, setSelectedLog] = useState<LogEntry | ConversationEntry | null>(null)
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+  const parentRef = useRef<HTMLDivElement>(null)
+
+  const filteredLogs = useMemo(() => {
+    if (sourceType === 'history') {
+      if (!filter) return conversations
+      const lowerFilter = filter.toLowerCase()
+      return conversations.filter(
+        (c) =>
+          c.prompt.toLowerCase().includes(lowerFilter) ||
+          c.response.toLowerCase().includes(lowerFilter) ||
+          c.apiKey.toLowerCase().includes(lowerFilter) ||
+          c.model.toLowerCase().includes(lowerFilter)
+      )
+    }
+
+    if (!monitor) return []
+    if (!filter) return monitor.logs
+    const lowerFilter = filter.toLowerCase()
+    return monitor.logs.filter(
+      (log) =>
+        log.message.toLowerCase().includes(lowerFilter) ||
+        log.source.toLowerCase().includes(lowerFilter) ||
+        log.event.toLowerCase().includes(lowerFilter) ||
+        log.level.toLowerCase().includes(lowerFilter)
+    )
+  }, [monitor, conversations, sourceType, filter])
+
+  const rowVirtualizer = useVirtualizer({
+    count: filteredLogs.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => sourceType === 'history' ? 80 : 64,
+    overscan: 20,
+  })
+
+  const handleLogClick = useCallback((log: LogEntry | ConversationEntry) => {
+    setSelectedLog(log)
+    setIsDialogOpen(true)
+  }, [])
+
+  // Check for scroll end to fetch more in history mode
+  useEffect(() => {
+    if (sourceType !== 'history') return
+    const scrollElement = parentRef.current
+    if (!scrollElement) return
+
+    const handleScroll = () => {
+      if (
+        scrollElement.scrollHeight - scrollElement.scrollTop <= scrollElement.clientHeight + 100 &&
+        !conversationsLoading &&
+        conversations.length < totalConversations
+      ) {
+        fetchMoreConversations()
+      }
+    }
+
+    scrollElement.addEventListener('scroll', handleScroll)
+    return () => scrollElement.removeEventListener('scroll', handleScroll)
+  }, [sourceType, conversationsLoading, conversations.length, totalConversations, fetchMoreConversations])
+
+  if (monitorError) {
+    return (
+      <Alert variant="destructive">
+        <AlertTriangle className="h-4 w-4" />
+        <AlertTitle>Error</AlertTitle>
+        <AlertDescription>{monitorError}</AlertDescription>
+      </Alert>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+        <SummaryCard
+          title="Total Logs"
+          value={monitor ? formatNumber(monitor.logs.length) : "..."}
+          detail="Buffered entries (last 512KB)"
+          icon={FileText}
+        />
+        <SummaryCard
+          title="Errors"
+          value={monitor ? formatNumber(monitor.logs.filter((l) => l.level === "error").length) : "..."}
+          detail="Critical system failures"
+          icon={ShieldAlert}
+        />
+        <SummaryCard
+          title="Active Run"
+          value={monitor?.logs[0]?.runId?.split("-").pop() ?? "None"}
+          detail="Current process instance"
+          icon={Activity}
+        />
+        <SummaryCard
+          title="Last Event"
+          value={monitor?.logs[0] ? formatDateTime(monitor.logs[0].timestamp) : "..."}
+          detail="Latest structured log"
+          icon={Clock3}
+        />
+      </div>
+
+      <Card className="flex h-[750px] flex-col overflow-hidden">
+        <CardHeader className="flex-none border-b bg-muted/30 py-3">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="rounded-md bg-primary/10 p-2 text-primary">
+                <Terminal className="size-5" />
+              </div>
+              <div>
+                <CardTitle className="text-lg">System Monitor</CardTitle>
+                <CardDescription className="text-xs">Real-time structured events from CCS</CardDescription>
+              </div>
+            </div>
+            
+            <div className="flex flex-wrap items-center gap-3">
+              <Select value={sourceType} onValueChange={(v) => setSourceType(v as LogSourceType)}>
+                <SelectTrigger className="w-[160px] h-9">
+                  <SelectValue placeholder="Log Source" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ccs-core">CCS Core</SelectItem>
+                  <SelectItem value="cliproxy-traffic">CLIProxy Traffic</SelectItem>
+                </SelectContent>
+              </Select>
+
+              {sourceType === "cliproxy-traffic" && monitor?.availableFiles && (
+                <Select value={selectedFile} onValueChange={(v) => setSelectedFile(v ?? "")}>
+                  <SelectTrigger className="w-[240px] h-9">
+                    <SelectValue placeholder="Select log file" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {monitor.availableFiles.map((file) => (
+                      <SelectItem key={file.name} value={file.path}>
+                        {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+
+              <div className="flex flex-wrap items-center gap-3">
+                <Select value={sourceType} onValueChange={(v) => setSourceType(v as LogSourceType | 'history')}>
+                  <SelectTrigger className="w-[180px] h-9">
+                    <SelectValue placeholder="Log Source" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ccs-core">CCS Core (Live)</SelectItem>
+                    <SelectItem value="cliproxy-traffic">CLIProxy Traffic (Live)</SelectItem>
+                    <SelectItem value="history">Aggregated History</SelectItem>
+                  </SelectContent>
+                  </Select>
+
+                  {sourceType === 'history' && (
+                  <>
+                    <Select value={filterApiKey} onValueChange={(v) => setFilterApiKey(v ?? "all")}>
+                      <SelectTrigger className="w-[200px] h-9">
+                        <SelectValue placeholder="All API Keys" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All API Keys</SelectItem>
+                        {uniqueApiKeys.map((key) => (
+                          <SelectItem key={key} value={key}>
+                            {key.slice(0, 12)}...
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Button variant="outline" size="sm" onClick={syncLogs} className="h-9">
+                      <RefreshCw className="size-4" data-icon="inline-start" />
+                      Sync
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={classifyLogs} className="h-9 border-amber-500/50 text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/20">
+                      <Shield className="size-4" data-icon="inline-start" />
+                      Classify
+                      </Button>
+                      </>
+
+                  )}
+                {sourceType === "cliproxy-traffic" && monitor?.availableFiles && (
+                  <Select value={selectedFile} onValueChange={(v) => setSelectedFile(v ?? "")}>
+                    <SelectTrigger className="w-[240px] h-9">
+                      <SelectValue placeholder="Select log file" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {monitor.availableFiles.map((file) => (
+                        <SelectItem key={file.name} value={file.path}>
+                          {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+
+                <div className="relative w-full max-w-md md:w-64">
+                  <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    placeholder="Search logs..."
+                    className="h-9 pl-10"
+                    value={filter}
+                    onChange={(e) => setFilter(e.target.value)}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="min-h-0 flex-1 p-0">
+              {(monitorLoading || conversationsLoading) && filteredLogs.length === 0 ? (
+              <div className="flex h-full items-center justify-center">
+                <div className="flex flex-col items-center gap-4">
+                  <RefreshCw className="size-8 animate-spin text-primary" />
+                  <p className="text-sm text-muted-foreground">Retrieving logs from {sourceType === 'history' ? 'database' : 'system'}...</p>
+                </div>
+              </div>
+              ) : filteredLogs.length === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center text-muted-foreground">
+                <div className="mb-4 rounded-full bg-muted p-6">
+                  <Search className="size-10 opacity-20" />
+                </div>
+                <p className="font-medium">No matches found</p>
+                <p className="text-sm opacity-70">Try adjusting your filter or {sourceType === 'history' ? 'syncing logs' : 'refresh for updates'}.</p>
+              </div>
+              ) : (
+              <div ref={parentRef} className="h-full overflow-auto">
+                <div
+                  style={{
+                    height: `${rowVirtualizer.getTotalSize()}px`,
+                    width: "100%",
+                    position: "relative",
+                  }}
+                >
+                  {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+                    const log = filteredLogs[virtualItem.index]
+                    const isHistory = sourceType === 'history'
+                    const isError = !isHistory && (log as LogEntry).level === "error"
+
+                    return (
+                      <div
+                        key={virtualItem.key}
+                        onClick={() => handleLogClick(log)}
+                        style={{
+                          position: "absolute",
+                          top: 0,
+                          left: 0,
+                          width: "100%",
+                          height: `${virtualItem.size}px`,
+                          transform: `translateY(${virtualItem.start}px)`,
+                        }}
+                        className={cn(
+                          "group cursor-pointer border-b px-4 py-3 transition-colors hover:bg-muted/60",
+                          isError && "bg-destructive/5 hover:bg-destructive/10"
+                        )}
+                      >
+                        {isHistory ? (
+                          <div className="flex items-start gap-4">
+                            <div className="flex flex-col items-center gap-1.5 pt-0.5">
+                              <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+                                {formatDateTime((log as ConversationEntry).timestamp).split(' ')[1]}
+                              </span>
+                              <Badge variant="outline" className="h-4 px-1 text-[8px] uppercase tracking-tighter">
+                                {(log as ConversationEntry).model.slice(0, 10)}
+                              </Badge>
+                            </div>
+                            <div className="flex min-w-0 flex-1 flex-col gap-1">
+                              <div className="flex items-center gap-2 text-xs">
+                                <span className="font-bold text-primary/80">{(log as ConversationEntry).apiKey.slice(0, 12)}...</span>
+                                <span className="text-muted-foreground text-[10px]">{(log as ConversationEntry).sessionId.slice(0, 8)}</span>
+                              </div>
+                              <p className="truncate text-sm text-foreground/90 font-medium">
+                                {(log as ConversationEntry).prompt.replace(/\\n/g, ' ').slice(0, 150)}
+                              </p>
+                            </div>
+                            <div className="flex flex-none items-center gap-2 self-center">
+                              {(log as ConversationEntry).projectType && (log as ConversationEntry).projectType !== 'unknown' && (
+                                <Badge 
+                                  variant={(log as ConversationEntry).projectType === 'company' ? "secondary" : "outline"}
+                                  className={cn(
+                                    "text-[9px] uppercase font-bold",
+                                    (log as ConversationEntry).projectType === 'company' ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400" : "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400"
+                                  )}
+                                >
+                                  {(log as ConversationEntry).projectType === 'company' ? 'Company Project' : 'Personal/Outside'}
+                                </Badge>
+                              )}
+                              <Badge variant={(log as ConversationEntry).response ? "secondary" : "outline"} className="text-[10px]">
+                                {(log as ConversationEntry).response ? "Replied" : "Pending"}
+                              </Badge>
+                            </div>
+
+                          </div>
+                        ) : (
+                          <div className="flex items-start gap-4">
+                            <div className="flex flex-col items-center gap-1.5 pt-0.5">
+                              <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+                                {(log as LogEntry).timestamp.split("T")[1].slice(0, 8)}
+                              </span>
+                              <Badge 
+                                variant={getLogLevelVariant((log as LogEntry).level)} 
+                                className="h-4 w-12 justify-center px-0 text-[9px] font-bold uppercase tracking-wider"
+                              >
+                                {(log as LogEntry).level}
+                              </Badge>
+                            </div>
+
+                            <div className="flex min-w-0 flex-1 flex-col gap-1">
+                              <div className="flex items-center gap-2 text-xs">
+                                <span className="font-bold text-foreground/80">{(log as LogEntry).source}</span>
+                                <span className="text-muted-foreground">/</span>
+                                <span className="font-medium text-foreground/60">{(log as LogEntry).event}</span>
+                              </div>
+                              <p className="truncate text-sm text-foreground/90 group-hover:text-foreground">
+                                {(log as LogEntry).message}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+              )}
+              </CardContent>
+        <CardFooter className="flex-none justify-between border-t bg-muted/20 py-2 text-[10px] text-muted-foreground">
+          <div className="flex gap-4">
+            <span>
+              Showing {filteredLogs.length} entries {sourceType === "history" && `of ${totalConversations}`}
+            </span>
+            {sourceType === "history" && <span>Virtualized Database Mode</span>}
+          </div>
+          <div className="flex items-center gap-1">
+            <div
+              className={cn(
+                "size-1.5 rounded-full",
+                sourceType === "history" ? "bg-amber-500" : "bg-emerald-500 animate-pulse"
+              )}
+            />
+            {sourceType === "history" ? "Aggregated Store" : "Live Buffer"}
+          </div>
+        </CardFooter>
+      </Card>
+
+      <LogDetailDialog log={selectedLog} open={isDialogOpen} onOpenChange={setIsDialogOpen} />
+    </div>
+  )
+}
+
+
 export function DashboardClient() {
   const [view, setView] = useState<AppView>("dashboard")
   const [preset, setPreset] = useState<DatePreset>(DEFAULT_PRESET)
@@ -1050,6 +1516,19 @@ export function DashboardClient() {
   const [limits, setLimits] = useState<LimitsPayload | null>(null)
   const [limitsError, setLimitsError] = useState<string | null>(null)
   const [limitsLoading, setLimitsLoading] = useState(false)
+
+  const [monitor, setMonitor] = useState<MonitorPayload | null>(null)
+  const [monitorError, setMonitorError] = useState<string | null>(null)
+  const [monitorLoading, setMonitorLoading] = useState(false)
+  const [monitorSource, setMonitorSource] = useState<LogSourceType | "history">("ccs-core")
+  const [monitorFile, setMonitorFile] = useState<string>("")
+
+  const [conversations, setConversations] = useState<ConversationEntry[]>([])
+  const [totalConversations, setTotalConversations] = useState(0)
+  const [conversationsLoading, setConversationsLoading] = useState(false)
+  const [conversationsOffset, setConversationsOffset] = useState(0)
+  const [uniqueApiKeys, setUniqueApiKeys] = useState<string[]>([])
+  const [filterApiKey, setFilterApiKey] = useState<string>("all")
 
   const dashboardFrom = preset === "custom" ? from : ""
   const dashboardTo = preset === "custom" ? to : ""
@@ -1118,6 +1597,109 @@ export function DashboardClient() {
     return () => controller.abort()
   }, [view, refreshToken])
 
+  useEffect(() => {
+    if (view !== "monitor" && monitor) return
+    const controller = new AbortController()
+    setMonitorLoading(true)
+    setMonitorError(null)
+
+    const params = new URLSearchParams()
+    params.set("refresh", String(refreshToken))
+    params.set("sourceType", monitorSource)
+    if (monitorFile) params.set("fileName", monitorFile)
+
+    fetch(`/api/monitor?${params.toString()}`, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          const body = (await response.json().catch(() => null)) as { error?: string } | null
+          throw new Error(body?.error ?? `Request failed with ${response.status}`)
+        }
+        return response.json() as Promise<MonitorPayload>
+      })
+      .then((data) => setMonitor(data))
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return
+        setMonitorError(error instanceof Error ? error.message : "Failed to load logs")
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setMonitorLoading(false)
+        }
+      })
+
+    return () => controller.abort()
+  }, [view, refreshToken, monitorSource, monitorFile])
+
+  useEffect(() => {
+    if (view !== "monitor" || monitorSource !== "history") return
+    
+    const controller = new AbortController()
+    setConversationsLoading(true)
+
+    const params = new URLSearchParams()
+    params.set("offset", String(conversationsOffset))
+    params.set("limit", "50")
+    if (filterApiKey !== "all") params.set("apiKey", filterApiKey)
+
+    fetch(`/api/monitor/all?${params.toString()}`, {
+      signal: controller.signal,
+    })
+      .then(res => res.json())
+      .then((data: AllLogsPayload) => {
+        setConversations(prev => conversationsOffset === 0 ? data.logs : [...prev, ...data.logs])
+        setTotalConversations(data.total)
+        if (data.uniqueApiKeys) setUniqueApiKeys(data.uniqueApiKeys)
+      })
+      .catch(err => {
+        if (!controller.signal.aborted) console.error("History fetch failed", err)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setConversationsLoading(false)
+      })
+
+    return () => controller.abort()
+  }, [view, monitorSource, conversationsOffset, refreshToken, filterApiKey])
+
+  useEffect(() => {
+    setConversationsOffset(0)
+  }, [filterApiKey])
+
+  const syncLogs = useCallback(async () => {
+    setConversationsLoading(true)
+    try {
+      const res = await fetch(`/api/monitor/all?sync=true&limit=50`, { cache: 'no-store' })
+      const data: AllLogsPayload = await res.json()
+      setConversations(data.logs)
+      setTotalConversations(data.total)
+      setConversationsOffset(0)
+    } catch (err) {
+      console.error("Sync failed", err)
+    } finally {
+      setConversationsLoading(false)
+    }
+  }, [])
+
+  const classifyLogs = useCallback(async () => {
+    setConversationsLoading(true)
+    try {
+      await fetch(`/api/monitor/classify`, { method: 'POST' })
+      // Refresh current view
+      setRefreshToken(v => v + 1)
+    } catch (err) {
+      console.error("Classification failed", err)
+    } finally {
+      setConversationsLoading(false)
+    }
+  }, [])
+
+  const fetchMoreConversations = useCallback(() => {
+    if (conversationsLoading || conversations.length >= totalConversations) return
+    setConversationsOffset(prev => prev + 50)
+  }, [conversationsLoading, conversations.length, totalConversations])
+
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-4 px-4 py-4 md:px-6">
       <Card>
@@ -1139,6 +1721,10 @@ export function DashboardClient() {
                 <TabsTrigger value="limits">
                   <ShieldAlert />
                   Limits
+                </TabsTrigger>
+                <TabsTrigger value="monitor">
+                  <Terminal />
+                  Monitor
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -1167,8 +1753,27 @@ export function DashboardClient() {
           granularity={granularity}
           setGranularity={setGranularity}
         />
-      ) : (
+      ) : view === "limits" ? (
         <LimitsView limits={limits} limitsLoading={limitsLoading} limitsError={limitsError} />
+      ) : (
+        <MonitorView
+          monitor={monitor}
+          monitorLoading={monitorLoading}
+          monitorError={monitorError}
+          sourceType={monitorSource}
+          setSourceType={setMonitorSource}
+          selectedFile={monitorFile}
+          setSelectedFile={setMonitorFile}
+          conversations={conversations}
+          conversationsLoading={conversationsLoading}
+          totalConversations={totalConversations}
+          fetchMoreConversations={fetchMoreConversations}
+          syncLogs={syncLogs}
+          classifyLogs={classifyLogs}
+          uniqueApiKeys={uniqueApiKeys}
+          filterApiKey={filterApiKey}
+          setFilterApiKey={setFilterApiKey}
+        />
       )}
     </main>
   )

@@ -78,8 +78,62 @@ export interface DashboardPayload {
   models: DashboardModelRow[];
 }
 
-export type AppView = 'dashboard' | 'limits';
+export type AppView = 'dashboard' | 'limits' | 'monitor';
 export type AlertSeverity = 'info' | 'warning' | 'urgent';
+
+export interface LogEntry {
+  id: string;
+  timestamp: string;
+  level: 'info' | 'warn' | 'error' | 'debug';
+  source: string;
+  event: string;
+  message: string;
+  processId?: number;
+  runId?: string;
+  context?: Record<string, any>;
+  requestId?: string;
+  raw?: string; // For unstructured logs
+}
+
+export type LogSourceType = 'ccs-core' | 'cliproxy-traffic';
+
+export interface LogFileItem {
+  name: string;
+  size: number;
+  mtime: string;
+  path: string;
+}
+
+export interface MonitorPayload {
+  generatedAt: string;
+  logs: LogEntry[];
+  availableFiles?: LogFileItem[];
+}
+
+export interface ConversationEntry {
+  id: number;
+  sessionId: string;
+  apiKey: string;
+  timestamp: string;
+  timestampMs: number;
+  model: string;
+  prompt: string;
+  response: string;
+  statusCode?: number;
+  durationMs?: number;
+  source: string;
+  metadata?: any;
+  classification?: string;
+  projectType?: 'company' | 'outside' | 'unknown';
+  confidence?: number;
+}
+
+export interface AllLogsPayload {
+  generatedAt: string;
+  logs: ConversationEntry[];
+  total: number;
+  uniqueApiKeys?: string[];
+}
 
 export interface LimitsQuotaWindow {
   label: string;
